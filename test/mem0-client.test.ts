@@ -1,6 +1,10 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { applyOssStorageDefaults, resolveDefaultOssStoragePaths } from "../src/mem0-client.js";
+import {
+  applyOssStorageDefaults,
+  resolveDefaultOssStoragePaths,
+  resolveOssMemoryCtor,
+} from "../src/mem0-client.js";
 
 describe("mem0 oss storage defaults", () => {
   it("uses .openclaw/memory-braid paths when missing", () => {
@@ -106,3 +110,31 @@ describe("mem0 oss storage defaults", () => {
   });
 });
 
+describe("mem0 oss export resolution", () => {
+  class FakeMemory {}
+
+  it("resolves named Memory export", () => {
+    const ctor = resolveOssMemoryCtor({ Memory: FakeMemory });
+    expect(ctor).toBe(FakeMemory);
+  });
+
+  it("resolves default.Memory export", () => {
+    const ctor = resolveOssMemoryCtor({ default: { Memory: FakeMemory } });
+    expect(ctor).toBe(FakeMemory);
+  });
+
+  it("resolves MemoryClient aliases", () => {
+    expect(resolveOssMemoryCtor({ MemoryClient: FakeMemory })).toBe(FakeMemory);
+    expect(resolveOssMemoryCtor({ default: { MemoryClient: FakeMemory } })).toBe(FakeMemory);
+  });
+
+  it("resolves default export when constructor is default", () => {
+    const ctor = resolveOssMemoryCtor({ default: FakeMemory });
+    expect(ctor).toBe(FakeMemory);
+  });
+
+  it("returns undefined when constructor export is unavailable", () => {
+    expect(resolveOssMemoryCtor({})).toBeUndefined();
+    expect(resolveOssMemoryCtor({ default: {} })).toBeUndefined();
+  });
+});

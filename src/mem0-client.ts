@@ -44,6 +44,8 @@ type OssClientLike = {
   delete: (memoryId: string) => Promise<{ message: string }>;
 };
 
+type OssMemoryCtor = new (config?: Record<string, unknown>) => OssClientLike;
+
 function extractCloudText(memory: CloudRecord): string {
   const byData = memory.data?.memory;
   if (typeof byData === "string" && byData.trim()) {
@@ -100,6 +102,30 @@ function asNonEmptyString(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function asOssMemoryCtor(value: unknown): OssMemoryCtor | undefined {
+  if (typeof value !== "function") {
+    return undefined;
+  }
+  return value as OssMemoryCtor;
+}
+
+export function resolveOssMemoryCtor(moduleValue: unknown): OssMemoryCtor | undefined {
+  if (!moduleValue) {
+    return undefined;
+  }
+
+  const mod = asRecord(moduleValue);
+  const defaultMod = asRecord(mod.default);
+
+  return (
+    asOssMemoryCtor(mod.Memory) ??
+    asOssMemoryCtor(mod.MemoryClient) ??
+    asOssMemoryCtor(defaultMod.Memory) ??
+    asOssMemoryCtor(defaultMod.MemoryClient) ??
+    asOssMemoryCtor(mod.default)
+  );
 }
 
 function resolveStateDir(explicitStateDir?: string): string {
@@ -319,10 +345,13 @@ export class Mem0Adapter {
 
     try {
       const mod = await import("mem0ai/oss");
-      const Memory = (mod as { Memory?: new (config?: Record<string, unknown>) => OssClientLike })
-        .Memory;
+      const Memory = resolveOssMemoryCtor(mod);
       if (!Memory) {
-        throw new Error("mem0ai/oss Memory export not found");
+        const exportKeys = Object.keys(asRecord(mod));
+        const defaultKeys = Object.keys(asRecord(asRecord(mod).default));
+        throw new Error(
+          `mem0ai/oss Memory export not found (exports=${exportKeys.join(",") || "none"}; default=${defaultKeys.join(",") || "none"})`,
+        );
       }
 
       const providedConfig = this.cfg.mem0.ossConfig;
