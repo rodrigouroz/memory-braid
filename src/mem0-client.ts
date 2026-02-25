@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { normalizeForHash } from "./chunking.js";
@@ -45,6 +46,13 @@ type OssClientLike = {
 };
 
 type OssMemoryCtor = new (config?: Record<string, unknown>) => OssClientLike;
+
+type LoadedOssModule = {
+  moduleValue: unknown;
+  loader: "require" | "import";
+  mem0Path?: string;
+  sqlite3Path?: string;
+};
 
 function extractCloudText(memory: CloudRecord): string {
   const byData = memory.data?.memory;
@@ -135,6 +143,34 @@ function resolveCtorFromCandidate(candidate: unknown, depth = 0): OssMemoryCtor 
     resolveCtorFromCandidate(record.MemoryClient, depth + 1) ??
     resolveCtorFromCandidate(record.default, depth + 1)
   );
+}
+
+function asErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function isSqliteBindingsError(error: unknown): boolean {
+  const message = asErrorMessage(error);
+  return /Could not locate the bindings file/i.test(message) || /node_sqlite3\.node/i.test(message);
+}
+
+function createLocalRequire(): NodeJS.Require {
+  return createRequire(import.meta.url);
+}
+
+function tryResolve(requireFn: NodeJS.Require, id: string): string | undefined {
+  try {
+    return requireFn.resolve(id);
+  } catch {
+    return undefined;
+  }
+}
+
+function tryRequire(requireFn: NodeJS.Require, id: string): unknown {
+  return requireFn(id);
 }
 
 export function resolveOssMemoryCtor(moduleValue: unknown): OssMemoryCtor | undefined {
@@ -362,7 +398,7 @@ export class Mem0Adapter {
     }
 
     try {
-      const mod = await import("mem0ai/oss");
+      const { moduleValue: mod, loader, mem0Path, sqlite3Path } = await this.loadOssModule();
       const Memory = resolveOssMemoryCtor(mod);
       if (!Memory) {
         const exportKeys = Object.keys(asRecord(mod));
@@ -384,6 +420,9 @@ export class Mem0Adapter {
       this.log.debug("memory_braid.mem0.response", {
         action: "init",
         mode: "oss",
+        loader,
+        mem0Path,
+        sqlite3Path,
         hasCustomConfig,
         sqliteDbPaths: collectSqliteDbPaths(configToUse),
       }, true);
@@ -396,6 +435,53 @@ export class Mem0Adapter {
       });
       return null;
     }
+  }
+
+  private async loadOssModule(): Promise<LoadedOssModule> {
+    const requireFromHere = createLocalRequire();
+    const sqlite3Path = tryResolve(requireFromHere, "sqlite3");
+    if (sqlite3Path) {
+      try {
+        tryRequire(requireFromHere, sqlite3Path);
+      } catch (error) {
+        this.log.warn("memory_braid.mem0.error", {
+          reason: "sqlite3_preload_failed",
+          mode: "oss",
+          sqlite3Path,
+          error: asErrorMessage(error),
+        });
+      }
+    }
+
+    const mem0Path = tryResolve(requireFromHere, "mem0ai/oss");
+    if (mem0Path) {
+      try {
+        const required = tryRequire(requireFromHere, mem0Path);
+        return {
+          moduleValue: required,
+          loader: "require",
+          mem0Path,
+          sqlite3Path,
+        };
+      } catch (error) {
+        this.log.warn("memory_braid.mem0.error", {
+          reason: "oss_require_failed",
+          mode: "oss",
+          mem0Path,
+          sqlite3Path,
+          sqliteBindingsError: isSqliteBindingsError(error),
+          error: asErrorMessage(error),
+        });
+      }
+    }
+
+    const imported = await import("mem0ai/oss");
+    return {
+      moduleValue: imported,
+      loader: "import",
+      mem0Path,
+      sqlite3Path,
+    };
   }
 
   async ensureClient(): Promise<{ mode: "cloud" | "oss"; client: CloudClientLike | OssClientLike } | null> {

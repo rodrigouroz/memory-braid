@@ -20,7 +20,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.3.4
+openclaw plugins install memory-braid@0.3.5
 ```
 
 2. Rebuild native dependencies inside the installed extension:
@@ -71,6 +71,7 @@ openclaw gateway restart
 If you install from npm and see native module errors like:
 
 - `Could not locate the bindings file` (sqlite3)
+- `.../node_modules/jiti/.../node_sqlite3.node` in the stack/error text
 - `Cannot find module ... sharp-*.node`
 
 run:
@@ -80,6 +81,10 @@ cd ~/.openclaw/extensions/memory-braid
 npm rebuild sqlite3 sharp
 openclaw gateway restart
 ```
+
+Note:
+- The `jiti/.../node_sqlite3.node` error is still a sqlite native artifact/runtime loading issue.
+- `memory-braid` now preloads sqlite via native `require` to avoid that path, but you still need `npm rebuild sqlite3 sharp` after `--ignore-scripts` installs.
 
 ## Quick start: hybrid capture + multilingual NER
 
