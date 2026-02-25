@@ -1,6 +1,6 @@
 {
   "name": "memory-braid",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "OpenClaw memory plugin that augments local memory with Mem0, bootstrap import, reconcile, and capture.",
   "type": "module",
   "main": "./src/index.ts",
