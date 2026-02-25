@@ -336,11 +336,13 @@ export class Mem0Adapter {
   private ossClient: OssClientLike | null = null;
   private readonly cfg: MemoryBraidConfig;
   private readonly log: MemoryBraidLogger;
+  private readonly pluginDir?: string;
   private stateDir?: string;
 
   constructor(cfg: MemoryBraidConfig, log: MemoryBraidLogger, options?: Mem0AdapterOptions) {
     this.cfg = cfg;
     this.log = log;
+    this.pluginDir = this.resolvePluginDir();
     this.stateDir = options?.stateDir;
   }
 
@@ -428,9 +430,12 @@ export class Mem0Adapter {
       }, true);
       return this.ossClient;
     } catch (err) {
+      const sqliteBindingsError = isSqliteBindingsError(err);
       this.log.error("memory_braid.mem0.error", {
         reason: "init_failed",
         mode: "oss",
+        sqliteBindingsError,
+        ...(sqliteBindingsError ? this.nativeRebuildHint() : {}),
         error: err instanceof Error ? err.message : String(err),
       });
       return null;
@@ -447,6 +452,7 @@ export class Mem0Adapter {
         this.log.warn("memory_braid.mem0.error", {
           reason: "sqlite3_preload_failed",
           mode: "oss",
+          ...this.nativeRebuildHint(),
           sqlite3Path,
           error: asErrorMessage(error),
         });
@@ -464,12 +470,14 @@ export class Mem0Adapter {
           sqlite3Path,
         };
       } catch (error) {
+        const sqliteBindingsError = isSqliteBindingsError(error);
         this.log.warn("memory_braid.mem0.error", {
           reason: "oss_require_failed",
           mode: "oss",
           mem0Path,
           sqlite3Path,
-          sqliteBindingsError: isSqliteBindingsError(error),
+          sqliteBindingsError,
+          ...(sqliteBindingsError ? this.nativeRebuildHint() : {}),
           error: asErrorMessage(error),
         });
       }
@@ -481,6 +489,34 @@ export class Mem0Adapter {
       loader: "import",
       mem0Path,
       sqlite3Path,
+    };
+  }
+
+  private resolvePluginDir(): string | undefined {
+    const requireFromHere = createLocalRequire();
+    const packageJsonPath = tryResolve(requireFromHere, "../package.json");
+    if (!packageJsonPath) {
+      return undefined;
+    }
+    return path.dirname(packageJsonPath);
+  }
+
+  private nativeRebuildHint(): {
+    pluginDir?: string;
+    fixCommand: string;
+    why: string;
+  } {
+    if (this.pluginDir) {
+      return {
+        pluginDir: this.pluginDir,
+        fixCommand: `cd "${this.pluginDir}" && npm rebuild sqlite3 sharp && openclaw gateway restart`,
+        why: "OpenClaw plugin installs use --ignore-scripts, so sqlite3/sharp native artifacts may be missing after install/update.",
+      };
+    }
+
+    return {
+      fixCommand: "cd ~/.openclaw/extensions/memory-braid && npm rebuild sqlite3 sharp && openclaw gateway restart",
+      why: "OpenClaw plugin installs use --ignore-scripts, so sqlite3/sharp native artifacts may be missing after install/update.",
     };
   }
 

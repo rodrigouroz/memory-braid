@@ -85,6 +85,10 @@ openclaw gateway restart
 Note:
 - The `jiti/.../node_sqlite3.node` error is still a sqlite native artifact/runtime loading issue.
 - `memory-braid` now preloads sqlite via native `require` to avoid that path, but you still need `npm rebuild sqlite3 sharp` after `--ignore-scripts` installs.
+- When this happens, startup logs now include `memory_braid.mem0.error` with:
+  - `sqliteBindingsError: true`
+  - `fixCommand` (copy/paste command for that machine)
+  - `pluginDir` (resolved extension directory when available)
 
 ## Quick start: hybrid capture + multilingual NER
 
