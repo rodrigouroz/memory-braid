@@ -1,0 +1,129 @@
+{
+  "id": "memory-braid",
+  "name": "Memory Braid",
+  "description": "Hybrid memory plugin that augments local core/QMD memory with Mem0 recall, capture, bootstrap import, and reconcile.",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "mem0": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": { "type": "string", "enum": ["cloud", "oss"], "default": "cloud" },
+          "apiKey": { "type": "string" },
+          "host": { "type": "string" },
+          "organizationId": { "type": "string" },
+          "projectId": { "type": "string" },
+          "ossConfig": {
+            "type": "object",
+            "additionalProperties": true,
+            "default": {}
+          }
+        }
+      },
+      "recall": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "maxResults": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 },
+          "injectTopK": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 },
+          "merge": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": { "type": "string", "enum": ["rrf"], "default": "rrf" },
+              "rrfK": { "type": "integer", "minimum": 1, "maximum": 500, "default": 60 },
+              "localWeight": { "type": "number", "minimum": 0, "maximum": 5, "default": 1 },
+              "mem0Weight": { "type": "number", "minimum": 0, "maximum": 5, "default": 1 }
+            }
+          }
+        }
+      },
+      "capture": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "extraction": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["heuristic", "heuristic_plus_ml"],
+                "default": "heuristic"
+              }
+            }
+          },
+          "ml": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": { "type": "string", "enum": ["openai", "anthropic", "gemini"] },
+              "model": { "type": "string" },
+              "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 30000, "default": 2500 },
+              "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 6 }
+            }
+          }
+        }
+      },
+      "bootstrap": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "startupMode": { "type": "string", "enum": ["async"], "default": "async" },
+          "includeMarkdown": { "type": "boolean", "default": true },
+          "includeSessions": { "type": "boolean", "default": true },
+          "sessionLookbackDays": { "type": "integer", "minimum": 1, "maximum": 3650, "default": 90 },
+          "batchSize": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+          "concurrency": { "type": "integer", "minimum": 1, "maximum": 16, "default": 3 }
+        }
+      },
+      "reconcile": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "intervalMinutes": { "type": "integer", "minimum": 1, "maximum": 1440, "default": 30 },
+          "batchSize": { "type": "integer", "minimum": 1, "maximum": 5000, "default": 100 },
+          "deleteStale": { "type": "boolean", "default": true }
+        }
+      },
+      "dedupe": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lexical": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "minJaccard": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 }
+            }
+          },
+          "semantic": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.92 }
+            }
+          }
+        }
+      },
+      "debug": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "includePayloads": { "type": "boolean", "default": false },
+          "maxSnippetChars": { "type": "integer", "minimum": 40, "maximum": 8000, "default": 500 },
+          "logSamplingRate": { "type": "number", "minimum": 0, "maximum": 1, "default": 1 }
+        }
+      }
+    }
+  }
+}

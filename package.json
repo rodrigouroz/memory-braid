@@ -1,0 +1,46 @@
+{
+  "name": "openclaw-memory-braid",
+  "version": "0.1.0",
+  "description": "OpenClaw memory plugin that augments local memory with Mem0, bootstrap import, reconcile, and capture.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "echo 'No build required. OpenClaw loads src/index.ts via jiti.'",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "memory",
+    "mem0"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.18"
+  },
+  "dependencies": {
+    "mem0ai": "^2.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.8",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
