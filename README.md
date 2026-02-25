@@ -103,6 +103,14 @@ For self-hosted Mem0 API-compatible deployments, also set `mem0.host`:
 
 If you want `mem0ai/oss` directly, set `mem0.mode` to `oss` and pass an `ossConfig`.
 
+By default, Memory Braid now auto-creates a state folder at
+`<OPENCLAW_STATE_DIR>/memory-braid` (typically `~/.openclaw/memory-braid`) and uses:
+
+- `mem0-history.db` for Mem0 history SQLite
+- `mem0-vector-store.db` for Mem0 in-memory vector store SQLite backend (`vectorStore.provider: "memory"`)
+
+You only need to set explicit DB paths if you want non-default locations.
+
 ```json
 {
   "plugins": {

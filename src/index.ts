@@ -188,7 +188,8 @@ const memoryBraidPlugin = {
   register(api: OpenClawPluginApi) {
     const cfg = parseConfig(api.pluginConfig);
     const log = new MemoryBraidLogger(api.logger, cfg.debug);
-    const mem0 = new Mem0Adapter(cfg, log);
+    const initialStateDir = api.runtime.state.resolveStateDir();
+    const mem0 = new Mem0Adapter(cfg, log, { stateDir: initialStateDir });
 
     let serviceTimer: NodeJS.Timeout | null = null;
     let statePaths: StatePaths | null = null;
@@ -416,6 +417,7 @@ const memoryBraidPlugin = {
     api.registerService({
       id: "memory-braid-service",
       start: async (ctx) => {
+        mem0.setStateDir(ctx.stateDir);
         statePaths = createStatePaths(ctx.stateDir);
         await ensureStateDir(statePaths);
         targets = await resolveTargets({

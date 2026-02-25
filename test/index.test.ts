@@ -22,6 +22,9 @@ describe("memory-braid plugin", () => {
         },
       },
       runtime: {
+        state: {
+          resolveStateDir: () => "/tmp/.openclaw",
+        },
         tools: {
           createMemorySearchTool: () => ({
             name: "memory_search",

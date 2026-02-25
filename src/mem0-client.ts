@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { normalizeForHash } from "./chunking.js";
 import type { MemoryBraidConfig } from "./config.js";
 import { MemoryBraidLogger } from "./logger.js";
@@ -84,9 +87,140 @@ function isLikelyOssConfig(value: unknown): boolean {
   return Object.keys(value as Record<string, unknown>).length > 0;
 }
 
-function buildDefaultOssConfig(cfg: MemoryBraidConfig): Record<string, unknown> {
-  const openAiKey = cfg.mem0.apiKey?.trim() || process.env.OPENAI_API_KEY || "";
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function resolveStateDir(explicitStateDir?: string): string {
+  const resolved =
+    explicitStateDir?.trim() ||
+    process.env.OPENCLAW_STATE_DIR?.trim() ||
+    path.join(os.homedir(), ".openclaw");
+  return path.resolve(resolved);
+}
+
+export function resolveDefaultOssStoragePaths(stateDir?: string): {
+  rootDir: string;
+  historyDbPath: string;
+  vectorDbPath: string;
+} {
+  const rootDir = path.join(resolveStateDir(stateDir), "memory-braid");
   return {
+    rootDir,
+    historyDbPath: path.join(rootDir, "mem0-history.db"),
+    vectorDbPath: path.join(rootDir, "mem0-vector-store.db"),
+  };
+}
+
+export function applyOssStorageDefaults(
+  source: Record<string, unknown>,
+  stateDir?: string,
+): Record<string, unknown> {
+  const { historyDbPath, vectorDbPath } = resolveDefaultOssStoragePaths(stateDir);
+  const merged: Record<string, unknown> = { ...source };
+
+  if (!asNonEmptyString(merged.historyDbPath)) {
+    merged.historyDbPath = historyDbPath;
+  }
+
+  const vectorStore = asRecord(merged.vectorStore);
+  const vectorProvider = asNonEmptyString(vectorStore.provider)?.toLowerCase();
+  if (!vectorProvider) {
+    merged.vectorStore = {
+      provider: "memory",
+      config: {
+        collectionName: "memories",
+        dimension: 1536,
+        dbPath: vectorDbPath,
+      },
+    };
+  } else if (vectorProvider === "memory") {
+    const vectorConfig = asRecord(vectorStore.config);
+    if (!asNonEmptyString(vectorConfig.dbPath)) {
+      merged.vectorStore = {
+        ...vectorStore,
+        config: {
+          ...vectorConfig,
+          dbPath: vectorDbPath,
+        },
+      };
+    }
+  }
+
+  const historyStore = asRecord(merged.historyStore);
+  const historyProvider = asNonEmptyString(historyStore.provider)?.toLowerCase();
+  if (!historyProvider) {
+    merged.historyStore = {
+      provider: "sqlite",
+      config: {
+        historyDbPath,
+      },
+    };
+  } else if (historyProvider === "sqlite") {
+    const historyConfig = asRecord(historyStore.config);
+    if (!asNonEmptyString(historyConfig.historyDbPath)) {
+      merged.historyStore = {
+        ...historyStore,
+        config: {
+          ...historyConfig,
+          historyDbPath,
+        },
+      };
+    }
+  }
+
+  return merged;
+}
+
+function collectSqliteDbPaths(config: Record<string, unknown>): string[] {
+  const paths: string[] = [];
+
+  const historyStore = asRecord(config.historyStore);
+  const historyProvider = asNonEmptyString(historyStore.provider)?.toLowerCase();
+  if (historyProvider === "sqlite") {
+    const historyPath = asNonEmptyString(asRecord(historyStore.config).historyDbPath);
+    if (historyPath && historyPath !== ":memory:") {
+      paths.push(historyPath);
+    }
+  } else {
+    const historyPath = asNonEmptyString(config.historyDbPath);
+    if (historyPath && historyPath !== ":memory:") {
+      paths.push(historyPath);
+    }
+  }
+
+  const vectorStore = asRecord(config.vectorStore);
+  const vectorProvider = asNonEmptyString(vectorStore.provider)?.toLowerCase();
+  if (vectorProvider === "memory") {
+    const vectorPath = asNonEmptyString(asRecord(vectorStore.config).dbPath);
+    if (vectorPath && vectorPath !== ":memory:") {
+      paths.push(vectorPath);
+    }
+  }
+
+  return Array.from(new Set(paths.map((entry) => path.resolve(entry))));
+}
+
+async function ensureSqliteParentDirs(config: Record<string, unknown>): Promise<void> {
+  for (const dbPath of collectSqliteDbPaths(config)) {
+    await fs.mkdir(path.dirname(dbPath), { recursive: true });
+  }
+}
+
+function buildDefaultOssConfig(cfg: MemoryBraidConfig, stateDir?: string): Record<string, unknown> {
+  const openAiKey = cfg.mem0.apiKey?.trim() || process.env.OPENAI_API_KEY || "";
+  return applyOssStorageDefaults({
     version: "v1.1",
     embedder: {
       provider: "openai",
@@ -110,18 +244,33 @@ function buildDefaultOssConfig(cfg: MemoryBraidConfig): Record<string, unknown> 
       },
     },
     enableGraph: false,
-  };
+  }, stateDir);
 }
+
+type Mem0AdapterOptions = {
+  stateDir?: string;
+};
 
 export class Mem0Adapter {
   private cloudClient: CloudClientLike | null = null;
   private ossClient: OssClientLike | null = null;
   private readonly cfg: MemoryBraidConfig;
   private readonly log: MemoryBraidLogger;
+  private stateDir?: string;
 
-  constructor(cfg: MemoryBraidConfig, log: MemoryBraidLogger) {
+  constructor(cfg: MemoryBraidConfig, log: MemoryBraidLogger, options?: Mem0AdapterOptions) {
     this.cfg = cfg;
     this.log = log;
+    this.stateDir = options?.stateDir;
+  }
+
+  setStateDir(stateDir?: string): void {
+    const next = stateDir?.trim();
+    if (!next || next === this.stateDir) {
+      return;
+    }
+    this.stateDir = next;
+    this.ossClient = null;
   }
 
   private async ensureCloudClient(): Promise<CloudClientLike | null> {
@@ -177,15 +326,19 @@ export class Mem0Adapter {
       }
 
       const providedConfig = this.cfg.mem0.ossConfig;
-      const configToUse = isLikelyOssConfig(providedConfig)
-        ? providedConfig
-        : buildDefaultOssConfig(this.cfg);
+      const hasCustomConfig = isLikelyOssConfig(providedConfig);
+      const baseConfig = hasCustomConfig
+        ? { ...providedConfig }
+        : buildDefaultOssConfig(this.cfg, this.stateDir);
+      const configToUse = applyOssStorageDefaults(baseConfig, this.stateDir);
+      await ensureSqliteParentDirs(configToUse);
 
       this.ossClient = new Memory(configToUse);
       this.log.debug("memory_braid.mem0.response", {
         action: "init",
         mode: "oss",
-        hasCustomConfig: isLikelyOssConfig(providedConfig),
+        hasCustomConfig,
+        sqliteDbPaths: collectSqliteDbPaths(configToUse),
       }, true);
       return this.ossClient;
     } catch (err) {
