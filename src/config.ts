@@ -20,14 +20,23 @@ export type MemoryBraidConfig = {
   };
   capture: {
     enabled: boolean;
-    extraction: {
-      mode: "heuristic" | "heuristic_plus_ml";
-    };
+    mode: "local" | "hybrid" | "ml";
+    maxItemsPerRun: number;
     ml: {
       provider?: "openai" | "anthropic" | "gemini";
       model?: string;
       timeoutMs: number;
-      maxItemsPerRun: number;
+    };
+  };
+  entityExtraction: {
+    enabled: boolean;
+    provider: "multilingual_ner";
+    model: string;
+    minScore: number;
+    maxEntitiesPerMemory: number;
+    startup: {
+      downloadOnStartup: boolean;
+      warmupText: string;
     };
   };
   bootstrap: {
@@ -84,14 +93,23 @@ const DEFAULTS: MemoryBraidConfig = {
   },
   capture: {
     enabled: true,
-    extraction: {
-      mode: "heuristic",
-    },
+    mode: "local",
+    maxItemsPerRun: 6,
     ml: {
       provider: undefined,
       model: undefined,
       timeoutMs: 2500,
-      maxItemsPerRun: 6,
+    },
+  },
+  entityExtraction: {
+    enabled: false,
+    provider: "multilingual_ner",
+    model: "Xenova/bert-base-multilingual-cased-ner-hrl",
+    minScore: 0.65,
+    maxEntitiesPerMemory: 8,
+    startup: {
+      downloadOnStartup: true,
+      warmupText: "John works at Acme in Berlin.",
     },
   },
   bootstrap: {
@@ -160,7 +178,8 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const recall = asRecord(root.recall);
   const merge = asRecord(recall.merge);
   const capture = asRecord(root.capture);
-  const extraction = asRecord(capture.extraction);
+  const entityExtraction = asRecord(root.entityExtraction);
+  const entityStartup = asRecord(entityExtraction.startup);
   const ml = asRecord(capture.ml);
   const bootstrap = asRecord(root.bootstrap);
   const reconcile = asRecord(root.reconcile);
@@ -170,8 +189,11 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const debug = asRecord(root.debug);
 
   const mode = mem0.mode === "oss" ? "oss" : "cloud";
-  const extractionMode =
-    extraction.mode === "heuristic_plus_ml" ? "heuristic_plus_ml" : "heuristic";
+  const rawCaptureMode = asString(capture.mode)?.toLowerCase();
+  const captureMode =
+    rawCaptureMode === "local" || rawCaptureMode === "hybrid" || rawCaptureMode === "ml"
+      ? rawCaptureMode
+      : DEFAULTS.capture.mode;
 
   return {
     enabled: asBoolean(root.enabled, DEFAULTS.enabled),
@@ -195,9 +217,8 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     },
     capture: {
       enabled: asBoolean(capture.enabled, DEFAULTS.capture.enabled),
-      extraction: {
-        mode: extractionMode,
-      },
+      mode: captureMode,
+      maxItemsPerRun: asInt(capture.maxItemsPerRun, DEFAULTS.capture.maxItemsPerRun, 1, 50),
       ml: {
         provider:
           ml.provider === "openai" || ml.provider === "anthropic" || ml.provider === "gemini"
@@ -205,7 +226,29 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
             : DEFAULTS.capture.ml.provider,
         model: asString(ml.model),
         timeoutMs: asInt(ml.timeoutMs, DEFAULTS.capture.ml.timeoutMs, 250, 30_000),
-        maxItemsPerRun: asInt(ml.maxItemsPerRun, DEFAULTS.capture.ml.maxItemsPerRun, 1, 50),
+      },
+    },
+    entityExtraction: {
+      enabled: asBoolean(entityExtraction.enabled, DEFAULTS.entityExtraction.enabled),
+      provider:
+        entityExtraction.provider === "multilingual_ner"
+          ? "multilingual_ner"
+          : DEFAULTS.entityExtraction.provider,
+      model: asString(entityExtraction.model) ?? DEFAULTS.entityExtraction.model,
+      minScore: asNumber(entityExtraction.minScore, DEFAULTS.entityExtraction.minScore, 0, 1),
+      maxEntitiesPerMemory: asInt(
+        entityExtraction.maxEntitiesPerMemory,
+        DEFAULTS.entityExtraction.maxEntitiesPerMemory,
+        1,
+        50,
+      ),
+      startup: {
+        downloadOnStartup: asBoolean(
+          entityStartup.downloadOnStartup,
+          DEFAULTS.entityExtraction.startup.downloadOnStartup,
+        ),
+        warmupText:
+          asString(entityStartup.warmupText) ?? DEFAULTS.entityExtraction.startup.warmupText,
       },
     },
     bootstrap: {

@@ -47,25 +47,48 @@
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": true },
-          "extraction": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "mode": {
-                "type": "string",
-                "enum": ["heuristic", "heuristic_plus_ml"],
-                "default": "heuristic"
-              }
-            }
+          "mode": {
+            "type": "string",
+            "enum": ["local", "hybrid", "ml"],
+            "default": "local"
           },
+          "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 6 },
           "ml": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
               "provider": { "type": "string", "enum": ["openai", "anthropic", "gemini"] },
               "model": { "type": "string" },
-              "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 30000, "default": 2500 },
-              "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 6 }
+              "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 30000, "default": 2500 }
+            }
+          }
+        }
+      },
+      "entityExtraction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "provider": {
+            "type": "string",
+            "enum": ["multilingual_ner"],
+            "default": "multilingual_ner"
+          },
+          "model": {
+            "type": "string",
+            "default": "Xenova/bert-base-multilingual-cased-ner-hrl"
+          },
+          "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 },
+          "maxEntitiesPerMemory": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 },
+          "startup": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "downloadOnStartup": { "type": "boolean", "default": true },
+              "warmupText": {
+                "type": "string",
+                "default": "John works at Acme in Berlin."
+              }
             }
           }
         }

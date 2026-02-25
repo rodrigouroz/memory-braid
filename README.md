@@ -7,12 +7,157 @@ Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory s
 - Hybrid recall: local memory + Mem0, merged with weighted RRF.
 - Install-time bootstrap import: indexes existing `MEMORY.md`, `memory.md`, `memory/**/*.md`, and recent sessions.
 - Periodic reconcile: keeps remote Mem0 chunks updated and deletes stale remote chunks.
-- Capture pipeline: heuristic extraction with optional ML enrichment mode.
+- Capture pipeline modes: `local`, `hybrid`, `ml`.
+- Optional entity extraction: multilingual NER with canonical `entity://...` URIs in memory metadata.
 - Structured debug logs for troubleshooting and tuning.
 
 ## Install
 
-Add this plugin to your OpenClaw plugin load path, then enable it as the active memory plugin.
+### Install from npm (recommended)
+
+On the target machine:
+
+1. Install from npm:
+
+```bash
+openclaw plugins install memory-braid@0.3.0
+```
+
+2. Enable and set as active memory slot:
+
+```bash
+openclaw plugins enable memory-braid
+openclaw config set plugins.slots.memory memory-braid
+```
+
+3. Restart gateway:
+
+```bash
+openclaw gateway restart
+```
+
+4. Confirm plugin is loaded:
+
+```bash
+openclaw plugins info memory-braid
+```
+
+Expected:
+- `Status: loaded`
+- `Tools: memory_search, memory_get`
+- `Services: memory-braid-service`
+
+### Install from local path (development)
+
+```bash
+openclaw plugins install --link /absolute/path/to/memory-braid
+openclaw plugins enable memory-braid
+openclaw config set plugins.slots.memory memory-braid
+openclaw gateway restart
+```
+
+## Quick start: hybrid capture + multilingual NER
+
+Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
+
+```json
+{
+  "mem0": {
+    "mode": "oss",
+    "ossConfig": {
+      "version": "v1.1",
+      "embedder": {
+        "provider": "openai",
+        "config": {
+          "apiKey": "${OPENAI_API_KEY}",
+          "model": "text-embedding-3-small"
+        }
+      },
+      "vectorStore": {
+        "provider": "memory",
+        "config": {
+          "collectionName": "memories",
+          "dimension": 1536
+        }
+      },
+      "llm": {
+        "provider": "openai",
+        "config": {
+          "apiKey": "${OPENAI_API_KEY}",
+          "model": "gpt-4o-mini"
+        }
+      },
+      "enableGraph": false
+    }
+  },
+  "capture": {
+    "enabled": true,
+    "mode": "hybrid",
+    "maxItemsPerRun": 6,
+    "ml": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "timeoutMs": 2500
+    }
+  },
+  "entityExtraction": {
+    "enabled": true,
+    "provider": "multilingual_ner",
+    "model": "Xenova/bert-base-multilingual-cased-ner-hrl",
+    "minScore": 0.65,
+    "maxEntitiesPerMemory": 8,
+    "startup": {
+      "downloadOnStartup": true,
+      "warmupText": "John works at Acme in Berlin."
+    }
+  },
+  "debug": {
+    "enabled": true
+  }
+}
+```
+
+Then restart:
+
+```bash
+openclaw gateway restart
+```
+
+## Verification checklist
+
+1. Check runtime status:
+
+```bash
+openclaw plugins info memory-braid
+openclaw gateway status
+```
+
+2. Trigger/inspect NER warmup:
+
+```bash
+openclaw agent --agent main --message "/memorybraid warmup" --json
+```
+
+3. Send a message that should be captured:
+
+```bash
+openclaw agent --agent main --message "Remember that Ana works at OpenClaw and likes ramen." --json
+```
+
+4. Inspect logs for capture + NER:
+
+```bash
+rg -n "memory_braid\\.startup|memory_braid\\.capture|memory_braid\\.entity|memory_braid\\.mem0" ~/.openclaw/logs/gateway.log | tail -n 80
+```
+
+Expected events:
+- `memory_braid.startup`
+- `memory_braid.entity.model_load`
+- `memory_braid.entity.warmup`
+- `memory_braid.capture.extract`
+- `memory_braid.capture.ml` (for `capture.mode=hybrid|ml`)
+- `memory_braid.entity.extract`
+- `memory_braid.capture.persist`
 
 ## Self-hosting quick guide
 
@@ -241,14 +386,23 @@ Use this preset when:
       },
       "capture": {
         "enabled": true,
-        "extraction": {
-          "mode": "heuristic"
-        },
+        "mode": "hybrid",
+        "maxItemsPerRun": 6,
         "ml": {
           "provider": "openai",
           "model": "gpt-4o-mini",
-          "timeoutMs": 2500,
-          "maxItemsPerRun": 6
+          "timeoutMs": 2500
+        }
+      },
+      "entityExtraction": {
+        "enabled": true,
+        "provider": "multilingual_ner",
+        "model": "Xenova/bert-base-multilingual-cased-ner-hrl",
+        "minScore": 0.65,
+        "maxEntitiesPerMemory": 8,
+        "startup": {
+          "downloadOnStartup": true,
+          "warmupText": "John works at Acme in Berlin."
         }
       },
       "dedupe": {
@@ -265,6 +419,48 @@ Use this preset when:
   }
 }
 ```
+
+## Capture defaults
+
+Capture defaults are:
+
+- `capture.enabled`: `true`
+- `capture.mode`: `"local"`
+- `capture.maxItemsPerRun`: `6`
+- `capture.ml.provider`: unset
+- `capture.ml.model`: unset
+- `capture.ml.timeoutMs`: `2500`
+
+Important behavior:
+
+- `capture.mode = "local"`: heuristic-only extraction.
+- `capture.mode = "hybrid"`: heuristic extraction + ML enrichment when ML config is set.
+- `capture.mode = "ml"`: ML-first extraction; falls back to heuristic if ML config/call is unavailable.
+- ML calls run only when both `capture.ml.provider` and `capture.ml.model` are set.
+
+## Entity extraction defaults
+
+Entity extraction defaults are:
+
+- `entityExtraction.enabled`: `false`
+- `entityExtraction.provider`: `"multilingual_ner"`
+- `entityExtraction.model`: `"Xenova/bert-base-multilingual-cased-ner-hrl"`
+- `entityExtraction.minScore`: `0.65`
+- `entityExtraction.maxEntitiesPerMemory`: `8`
+- `entityExtraction.startup.downloadOnStartup`: `true`
+- `entityExtraction.startup.warmupText`: `"John works at Acme in Berlin."`
+
+When enabled:
+
+- Model cache/download path is `<OPENCLAW_STATE_DIR>/memory-braid/models/entity-extraction` (typically `~/.openclaw/memory-braid/models/entity-extraction`).
+- Captured memories get `metadata.entities` and `metadata.entityUris` (canonical IDs like `entity://person/john-doe`).
+- Startup can pre-download/warm the model (`downloadOnStartup: true`).
+
+Warmup command:
+
+- `/memorybraid status`
+- `/memorybraid warmup`
+- `/memorybraid warmup --force`
 
 ## Debugging
 
@@ -289,6 +485,7 @@ Key events:
 - `memory_braid.reconcile.begin|progress|complete|error`
 - `memory_braid.search.local|mem0|merge|inject`
 - `memory_braid.capture.extract|ml|persist|skip`
+- `memory_braid.entity.model_load|warmup|extract`
 - `memory_braid.mem0.request|response|error`
 
 `debug.includePayloads=true` includes payload fields; otherwise sensitive text fields are omitted.

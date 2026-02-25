@@ -6,6 +6,7 @@ describe("memory-braid plugin", () => {
     const tools: Array<{ factory: unknown; options?: unknown }> = [];
     const hooks: Array<{ name: string; handler: unknown }> = [];
     const services: Array<{ id: string; start: (ctx: unknown) => Promise<void> | void }> = [];
+    const commands: Array<{ name: string }> = [];
 
     const api = {
       pluginConfig: {},
@@ -52,6 +53,9 @@ describe("memory-braid plugin", () => {
       registerService: (service: { id: string; start: (ctx: unknown) => Promise<void> | void }) => {
         services.push(service);
       },
+      registerCommand: (command: { name: string }) => {
+        commands.push({ name: command.name });
+      },
     };
 
     await plugin.register(api as never);
@@ -61,5 +65,6 @@ describe("memory-braid plugin", () => {
       expect.arrayContaining(["before_agent_start", "agent_end"]),
     );
     expect(services.map((service) => service.id)).toContain("memory-braid-service");
+    expect(commands.map((command) => command.name)).toContain("memorybraid");
   });
 });

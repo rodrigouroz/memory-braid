@@ -3,6 +3,8 @@ import type { MemoryBraidConfig } from "./config.js";
 import { MemoryBraidLogger } from "./logger.js";
 import type { ExtractedCandidate } from "./types.js";
 
+type MlProvider = "openai" | "anthropic" | "gemini";
+
 const HEURISTIC_PATTERNS = [
   /remember|remember that|keep in mind|note that/i,
   /i prefer|prefer to|don't like|do not like|hate|love/i,
@@ -145,14 +147,11 @@ function parseJsonObjectArray(raw: string): Array<Record<string, unknown>> {
 }
 
 async function callMlEnrichment(params: {
-  provider: "openai" | "anthropic" | "gemini";
+  provider: MlProvider;
   model: string;
   timeoutMs: number;
   candidates: ExtractedCandidate[];
 }): Promise<Array<Record<string, unknown>>> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
-
   const prompt = [
     "Classify the memory candidates.",
     "Return ONLY JSON array.",
@@ -160,6 +159,52 @@ async function callMlEnrichment(params: {
     "Category one of: preference, decision, fact, task, other.",
     JSON.stringify(params.candidates.map((candidate, index) => ({ index, text: candidate.text }))),
   ].join("\n");
+  return callMlJson({
+    provider: params.provider,
+    model: params.model,
+    timeoutMs: params.timeoutMs,
+    prompt,
+  });
+}
+
+async function callMlExtraction(params: {
+  provider: MlProvider;
+  model: string;
+  timeoutMs: number;
+  maxItems: number;
+  messages: Array<{ role: string; text: string }>;
+}): Promise<Array<Record<string, unknown>>> {
+  const recent = params.messages.slice(-30).map((item) => ({
+    role: item.role,
+    text: item.text,
+  }));
+
+  const prompt = [
+    "Extract durable user memories from this conversation.",
+    "Return ONLY JSON array.",
+    "Each item: {text:string, category:string, score:number}.",
+    "Category one of: preference, decision, fact, task, other.",
+    "Keep each text concise and atomic.",
+    `Maximum items: ${params.maxItems}.`,
+    JSON.stringify(recent),
+  ].join("\n");
+
+  return callMlJson({
+    provider: params.provider,
+    model: params.model,
+    timeoutMs: params.timeoutMs,
+    prompt,
+  });
+}
+
+async function callMlJson(params: {
+  provider: MlProvider;
+  model: string;
+  timeoutMs: number;
+  prompt: string;
+}): Promise<Array<Record<string, unknown>>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
 
   try {
     if (params.provider === "openai") {
@@ -183,7 +228,7 @@ async function callMlEnrichment(params: {
             },
             {
               role: "user",
-              content: prompt,
+              content: params.prompt,
             },
           ],
         }),
@@ -212,7 +257,7 @@ async function callMlEnrichment(params: {
           model: params.model,
           max_tokens: 1000,
           temperature: 0,
-          messages: [{ role: "user", content: prompt }],
+          messages: [{ role: "user", content: params.prompt }],
         }),
         signal: controller.signal,
       });
@@ -236,7 +281,7 @@ async function callMlEnrichment(params: {
         },
         body: JSON.stringify({
           generationConfig: { temperature: 0 },
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          contents: [{ role: "user", parts: [{ text: params.prompt }] }],
         }),
         signal: controller.signal,
       },
@@ -249,6 +294,19 @@ async function callMlEnrichment(params: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function normalizeCategory(value: unknown, fallback: ExtractedCandidate["category"] = "other"): ExtractedCandidate["category"] {
+  if (
+    value === "preference" ||
+    value === "decision" ||
+    value === "fact" ||
+    value === "task" ||
+    value === "other"
+  ) {
+    return value;
+  }
+  return fallback;
 }
 
 function applyMlResult(
@@ -282,14 +340,7 @@ function applyMlResult(
     if (!keep) {
       continue;
     }
-    const category =
-      ml.category === "preference" ||
-      ml.category === "decision" ||
-      ml.category === "fact" ||
-      ml.category === "task" ||
-      ml.category === "other"
-        ? (ml.category as ExtractedCandidate["category"])
-        : candidate.category;
+    const category = normalizeCategory(ml.category, candidate.category);
     const score = typeof ml.score === "number" ? Math.max(0, Math.min(1, ml.score)) : candidate.score;
     out.push({
       ...candidate,
@@ -301,6 +352,39 @@ function applyMlResult(
   return out;
 }
 
+function applyMlExtractionResult(
+  result: Array<Record<string, unknown>>,
+  maxItems: number,
+): ExtractedCandidate[] {
+  const out: ExtractedCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (const item of result) {
+    const rawText = typeof item.text === "string" ? item.text : "";
+    const text = normalizeWhitespace(rawText);
+    if (!text || text.length < 20 || text.length > 3000) {
+      continue;
+    }
+    const key = sha256(normalizeForHash(text));
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+
+    out.push({
+      text,
+      category: normalizeCategory(item.category),
+      score: typeof item.score === "number" ? Math.max(0, Math.min(1, item.score)) : 0.5,
+      source: "ml",
+    });
+    if (out.length >= maxItems) {
+      break;
+    }
+  }
+
+  return out;
+}
+
 export async function extractCandidates(params: {
   messages: unknown[];
   cfg: MemoryBraidConfig;
@@ -308,42 +392,70 @@ export async function extractCandidates(params: {
   runId?: string;
 }): Promise<ExtractedCandidate[]> {
   const normalized = normalizeMessages(params.messages);
-  const heuristic = pickHeuristicCandidates(normalized, params.cfg.capture.ml.maxItemsPerRun);
+  const heuristic = pickHeuristicCandidates(normalized, params.cfg.capture.maxItemsPerRun);
 
   params.log.debug("memory_braid.capture.extract", {
     runId: params.runId,
+    mode: params.cfg.capture.mode,
     totalMessages: normalized.length,
     heuristicCandidates: heuristic.length,
   });
 
-  if (
-    params.cfg.capture.extraction.mode !== "heuristic_plus_ml" ||
-    !params.cfg.capture.ml.provider ||
-    !params.cfg.capture.ml.model
-  ) {
+  if (params.cfg.capture.mode === "local") {
+    return heuristic;
+  }
+
+  if (!params.cfg.capture.ml.provider || !params.cfg.capture.ml.model) {
+    params.log.warn("memory_braid.capture.ml", {
+      runId: params.runId,
+      reason: "missing_provider_or_model",
+      mode: params.cfg.capture.mode,
+    });
     return heuristic;
   }
 
   try {
-    const ml = await callMlEnrichment({
+    if (params.cfg.capture.mode === "hybrid") {
+      const ml = await callMlEnrichment({
+        provider: params.cfg.capture.ml.provider,
+        model: params.cfg.capture.ml.model,
+        timeoutMs: params.cfg.capture.ml.timeoutMs,
+        candidates: heuristic,
+      });
+      const enriched = applyMlResult(heuristic, ml);
+      params.log.debug("memory_braid.capture.ml", {
+        runId: params.runId,
+        mode: params.cfg.capture.mode,
+        provider: params.cfg.capture.ml.provider,
+        model: params.cfg.capture.ml.model,
+        requested: heuristic.length,
+        returned: ml.length,
+        enriched: enriched.length,
+      });
+      return enriched;
+    }
+
+    const mlExtractedRaw = await callMlExtraction({
       provider: params.cfg.capture.ml.provider,
       model: params.cfg.capture.ml.model,
       timeoutMs: params.cfg.capture.ml.timeoutMs,
-      candidates: heuristic,
+      maxItems: params.cfg.capture.maxItemsPerRun,
+      messages: normalized,
     });
-    const enriched = applyMlResult(heuristic, ml);
+    const mlExtracted = applyMlExtractionResult(mlExtractedRaw, params.cfg.capture.maxItemsPerRun);
     params.log.debug("memory_braid.capture.ml", {
       runId: params.runId,
+      mode: params.cfg.capture.mode,
       provider: params.cfg.capture.ml.provider,
       model: params.cfg.capture.ml.model,
-      requested: heuristic.length,
-      returned: ml.length,
-      enriched: enriched.length,
+      returned: mlExtractedRaw.length,
+      extracted: mlExtracted.length,
     });
-    return enriched;
+    return mlExtracted.length > 0 ? mlExtracted : heuristic;
   } catch (err) {
     params.log.warn("memory_braid.capture.ml", {
       runId: params.runId,
+      mode: params.cfg.capture.mode,
       error: err instanceof Error ? err.message : String(err),
     });
     return heuristic;
