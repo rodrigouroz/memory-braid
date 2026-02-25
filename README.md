@@ -20,23 +20,35 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.3.0
+openclaw plugins install memory-braid@0.3.1
 ```
 
-2. Enable and set as active memory slot:
+2. Rebuild native dependencies inside the installed extension:
+
+```bash
+cd ~/.openclaw/extensions/memory-braid
+npm rebuild sqlite3 sharp
+```
+
+Why this step exists:
+- OpenClaw plugin installs run `npm install --omit=dev --ignore-scripts` for safety.
+- This behavior is currently not user-overridable from `openclaw plugins install`.
+- `memory-braid` needs native artifacts for `sqlite3` (required by Mem0 OSS) and `sharp` (used by `@xenova/transformers`).
+
+3. Enable and set as active memory slot:
 
 ```bash
 openclaw plugins enable memory-braid
 openclaw config set plugins.slots.memory memory-braid
 ```
 
-3. Restart gateway:
+4. Restart gateway:
 
 ```bash
 openclaw gateway restart
 ```
 
-4. Confirm plugin is loaded:
+5. Confirm plugin is loaded:
 
 ```bash
 openclaw plugins info memory-braid
@@ -53,6 +65,19 @@ Expected:
 openclaw plugins install --link /absolute/path/to/memory-braid
 openclaw plugins enable memory-braid
 openclaw config set plugins.slots.memory memory-braid
+openclaw gateway restart
+```
+
+If you install from npm and see native module errors like:
+
+- `Could not locate the bindings file` (sqlite3)
+- `Cannot find module ... sharp-*.node`
+
+run:
+
+```bash
+cd ~/.openclaw/extensions/memory-braid
+npm rebuild sqlite3 sharp
 openclaw gateway restart
 ```
 
