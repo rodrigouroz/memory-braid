@@ -111,20 +111,38 @@ function asOssMemoryCtor(value: unknown): OssMemoryCtor | undefined {
   return value as OssMemoryCtor;
 }
 
-export function resolveOssMemoryCtor(moduleValue: unknown): OssMemoryCtor | undefined {
-  if (!moduleValue) {
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveCtorFromCandidate(candidate: unknown, depth = 0): OssMemoryCtor | undefined {
+  if (depth > 6 || !candidate) {
     return undefined;
   }
 
-  const mod = asRecord(moduleValue);
-  const defaultMod = asRecord(mod.default);
+  const direct = asOssMemoryCtor(candidate);
+  if (direct) {
+    return direct;
+  }
 
+  if (!isObjectLike(candidate)) {
+    return undefined;
+  }
+
+  const record = candidate as Record<string, unknown>;
   return (
-    asOssMemoryCtor(mod.Memory) ??
-    asOssMemoryCtor(mod.MemoryClient) ??
-    asOssMemoryCtor(defaultMod.Memory) ??
-    asOssMemoryCtor(defaultMod.MemoryClient) ??
-    asOssMemoryCtor(mod.default)
+    resolveCtorFromCandidate(record.Memory, depth + 1) ??
+    resolveCtorFromCandidate(record.MemoryClient, depth + 1) ??
+    resolveCtorFromCandidate(record.default, depth + 1)
+  );
+}
+
+export function resolveOssMemoryCtor(moduleValue: unknown): OssMemoryCtor | undefined {
+  return (
+    resolveCtorFromCandidate(moduleValue) ??
+    resolveCtorFromCandidate(asRecord(moduleValue).Memory) ??
+    resolveCtorFromCandidate(asRecord(moduleValue).MemoryClient) ??
+    resolveCtorFromCandidate(asRecord(moduleValue).default)
   );
 }
 

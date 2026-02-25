@@ -133,6 +133,16 @@ describe("mem0 oss export resolution", () => {
     expect(ctor).toBe(FakeMemory);
   });
 
+  it("resolves nested default-wrapped Memory constructor", () => {
+    const ctor = resolveOssMemoryCtor({ Memory: { default: FakeMemory } });
+    expect(ctor).toBe(FakeMemory);
+  });
+
+  it("resolves deeply nested default wrapper shapes", () => {
+    const ctor = resolveOssMemoryCtor({ default: { default: { Memory: FakeMemory } } });
+    expect(ctor).toBe(FakeMemory);
+  });
+
   it("returns undefined when constructor export is unavailable", () => {
     expect(resolveOssMemoryCtor({})).toBeUndefined();
     expect(resolveOssMemoryCtor({ default: {} })).toBeUndefined();
