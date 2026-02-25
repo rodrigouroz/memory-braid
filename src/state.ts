@@ -97,21 +97,37 @@ export async function writeCaptureDedupeState(
 export async function withStateLock<T>(
   lockFilePath: string,
   fn: () => Promise<T>,
-  options?: { retries?: number; retryDelayMs?: number },
+  options?: { retries?: number; retryDelayMs?: number; staleLockMs?: number },
 ): Promise<T> {
   const retries = options?.retries ?? 12;
   const retryDelayMs = options?.retryDelayMs ?? 150;
+  const staleLockMs = options?.staleLockMs ?? 30_000;
   await fs.mkdir(path.dirname(lockFilePath), { recursive: true });
 
   let handle: fs.FileHandle | null = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
       handle = await fs.open(lockFilePath, "wx");
+      await handle.writeFile(
+        `${JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
       break;
     } catch (err) {
       const code = (err as { code?: string }).code;
-      if (code !== "EEXIST" || attempt >= retries) {
+      if (code !== "EEXIST") {
         throw err;
+      }
+      const recovered = await recoverStaleLock(lockFilePath, staleLockMs);
+      if (recovered) {
+        attempt -= 1;
+        continue;
+      }
+      if (attempt >= retries) {
+        throw new Error(`Failed to acquire lock for ${lockFilePath}: lock file already exists`);
       }
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
@@ -127,4 +143,57 @@ export async function withStateLock<T>(
     await handle.close().catch(() => undefined);
     await fs.unlink(lockFilePath).catch(() => undefined);
   }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "ESRCH") {
+      return false;
+    }
+    return true;
+  }
+}
+
+async function recoverStaleLock(lockFilePath: string, staleLockMs: number): Promise<boolean> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    stat = await fs.stat(lockFilePath);
+  } catch {
+    return false;
+  }
+
+  const ageMs = Date.now() - stat.mtimeMs;
+
+  let raw: string | null = null;
+  try {
+    raw = await fs.readFile(lockFilePath, "utf8");
+  } catch {
+    raw = null;
+  }
+
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { pid?: unknown };
+      if (typeof parsed.pid === "number" && Number.isFinite(parsed.pid)) {
+        if (isProcessAlive(parsed.pid)) {
+          return false;
+        }
+        await fs.unlink(lockFilePath).catch(() => undefined);
+        return true;
+      }
+    } catch {
+      // Legacy lock file format, handled by age-based fallback below.
+    }
+  }
+
+  if (ageMs < staleLockMs) {
+    return false;
+  }
+
+  await fs.unlink(lockFilePath).catch(() => undefined);
+  return true;
 }

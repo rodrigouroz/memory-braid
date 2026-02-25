@@ -593,6 +593,11 @@ const memoryBraidPlugin = {
           log,
           targets,
           runId,
+        }).catch((err) => {
+          log.warn("memory_braid.bootstrap.error", {
+            runId,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
 
         // One startup reconcile pass (non-blocking).
@@ -603,6 +608,13 @@ const memoryBraidPlugin = {
           log,
           targets,
           reason: "startup",
+          runId,
+        }).catch((err) => {
+          log.warn("memory_braid.reconcile.error", {
+            runId,
+            reason: "startup",
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
 
         if (cfg.entityExtraction.enabled && cfg.entityExtraction.startup.downloadOnStartup) {
