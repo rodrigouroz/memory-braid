@@ -157,6 +157,20 @@ function isSqliteBindingsError(error: unknown): boolean {
   return /Could not locate the bindings file/i.test(message) || /node_sqlite3\.node/i.test(message);
 }
 
+export function isMem0DeleteNotFoundError(error: unknown): boolean {
+  const message = asErrorMessage(error).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return (
+    /\bmemory\b.*\bnot found\b/.test(message) ||
+    /\bnot found\b.*\bmemory\b/.test(message) ||
+    /\bmemory\b.*\bdoes not exist\b/.test(message) ||
+    /\bno such memory\b/.test(message)
+  );
+}
+
 function createLocalRequire(): NodeJS.Require {
   return createRequire(import.meta.url);
 }
@@ -738,6 +752,21 @@ export class Mem0Adapter {
       });
       return true;
     } catch (err) {
+      const missingRemote = isMem0DeleteNotFoundError(err);
+      if (missingRemote) {
+        this.log.debug("memory_braid.mem0.response", {
+          runId: params.runId,
+          action: "delete",
+          mode: prepared.mode,
+          workspaceHash: params.scope.workspaceHash,
+          agentId: params.scope.agentId,
+          memoryId: params.memoryId,
+          durMs: Date.now() - startedAt,
+          alreadyMissing: true,
+        });
+        return true;
+      }
+
       this.log.warn("memory_braid.mem0.error", {
         runId: params.runId,
         action: "delete",

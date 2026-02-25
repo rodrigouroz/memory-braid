@@ -440,6 +440,34 @@ const memoryBraidPlugin = {
       }
 
       if (!statePaths) {
+        const resolvedStateDir = api.runtime.state.resolveStateDir();
+        if (resolvedStateDir) {
+          const lazyStatePaths = createStatePaths(resolvedStateDir);
+          try {
+            await ensureStateDir(lazyStatePaths);
+            statePaths = lazyStatePaths;
+            mem0.setStateDir(resolvedStateDir);
+            entityExtraction.setStateDir(resolvedStateDir);
+            log.info("memory_braid.state.ready", {
+              runId,
+              reason: "lazy_capture",
+              stateDir: resolvedStateDir,
+            });
+          } catch (err) {
+            log.warn("memory_braid.capture.skip", {
+              runId,
+              reason: "state_init_failed",
+              workspaceHash: scope.workspaceHash,
+              agentId: scope.agentId,
+              sessionKey: scope.sessionKey,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return;
+          }
+        }
+      }
+
+      if (!statePaths) {
         log.warn("memory_braid.capture.skip", {
           runId,
           reason: "state_not_ready",
