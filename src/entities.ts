@@ -20,6 +20,14 @@ export type ExtractedEntity = {
   canonicalUri: string;
 };
 
+function summarizeEntityTypes(entities: ExtractedEntity[]): Record<string, number> {
+  const summary: Record<string, number> = {};
+  for (const entity of entities) {
+    summary[entity.type] = (summary[entity.type] ?? 0) + 1;
+  }
+  return summary;
+}
+
 function resolveStateDir(explicitStateDir?: string): string {
   const resolved =
     explicitStateDir?.trim() ||
@@ -167,6 +175,8 @@ export class EntityExtractionManager {
         model: this.cfg.model,
         cacheDir: resolveEntityModelCacheDir(this.stateDir),
         entities: entities.length,
+        entityTypes: summarizeEntityTypes(entities),
+        sampleEntityUris: entities.slice(0, 5).map((entry) => entry.canonicalUri),
         durMs: Date.now() - startedAt,
       });
       return {
@@ -219,6 +229,8 @@ export class EntityExtractionManager {
         provider: this.cfg.provider,
         model: this.cfg.model,
         entities: entities.length,
+        entityTypes: summarizeEntityTypes(entities),
+        sampleEntityUris: entities.slice(0, 5).map((entry) => entry.canonicalUri),
       });
       return entities;
     } catch (err) {
@@ -340,4 +352,3 @@ export class EntityExtractionManager {
       .slice(0, this.cfg.maxEntitiesPerMemory);
   }
 }
-

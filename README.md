@@ -481,14 +481,34 @@ Set:
 Key events:
 
 - `memory_braid.startup`
+- `memory_braid.config`
 - `memory_braid.bootstrap.begin|complete|error`
 - `memory_braid.reconcile.begin|progress|complete|error`
-- `memory_braid.search.local|mem0|merge|inject`
+- `memory_braid.search.local|mem0|merge|inject|skip`
 - `memory_braid.capture.extract|ml|persist|skip`
 - `memory_braid.entity.model_load|warmup|extract`
 - `memory_braid.mem0.request|response|error`
 
 `debug.includePayloads=true` includes payload fields; otherwise sensitive text fields are omitted.
+
+Traceability tips:
+
+- Use `runId` to follow one execution end-to-end across capture/search/entity/mem0 events.
+- `memory_braid.capture.persist` includes high-signal counters:
+  - `dedupeSkipped`
+  - `mem0AddAttempts`
+  - `mem0AddWithId`
+  - `mem0AddWithoutId`
+  - `entityAnnotatedCandidates`
+  - `totalEntitiesAttached`
+- `memory_braid.capture.ml` includes `fallbackUsed` and fallback reasons when ML is unavailable.
+- `memory_braid.entity.extract` includes `entityTypes` and `sampleEntityUris`.
+
+Example:
+
+```bash
+rg -n "memory_braid\\.|runId\":\"<RUN_ID>\"" ~/.openclaw/logs/gateway.log | tail -n 120
+```
 
 ## Tests
 

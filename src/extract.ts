@@ -397,11 +397,18 @@ export async function extractCandidates(params: {
   params.log.debug("memory_braid.capture.extract", {
     runId: params.runId,
     mode: params.cfg.capture.mode,
+    maxItemsPerRun: params.cfg.capture.maxItemsPerRun,
     totalMessages: normalized.length,
     heuristicCandidates: heuristic.length,
   });
 
   if (params.cfg.capture.mode === "local") {
+    params.log.debug("memory_braid.capture.mode", {
+      runId: params.runId,
+      mode: params.cfg.capture.mode,
+      decision: "heuristic_only",
+      candidates: heuristic.length,
+    });
     return heuristic;
   }
 
@@ -410,6 +417,10 @@ export async function extractCandidates(params: {
       runId: params.runId,
       reason: "missing_provider_or_model",
       mode: params.cfg.capture.mode,
+      hasProvider: Boolean(params.cfg.capture.ml.provider),
+      hasModel: Boolean(params.cfg.capture.ml.model),
+      fallback: "heuristic",
+      candidates: heuristic.length,
     });
     return heuristic;
   }
@@ -431,6 +442,7 @@ export async function extractCandidates(params: {
         requested: heuristic.length,
         returned: ml.length,
         enriched: enriched.length,
+        fallbackUsed: ml.length === 0,
       });
       return enriched;
     }
@@ -450,6 +462,7 @@ export async function extractCandidates(params: {
       model: params.cfg.capture.ml.model,
       returned: mlExtractedRaw.length,
       extracted: mlExtracted.length,
+      fallbackUsed: mlExtracted.length === 0,
     });
     return mlExtracted.length > 0 ? mlExtracted : heuristic;
   } catch (err) {
@@ -457,6 +470,8 @@ export async function extractCandidates(params: {
       runId: params.runId,
       mode: params.cfg.capture.mode,
       error: err instanceof Error ? err.message : String(err),
+      fallback: "heuristic",
+      candidates: heuristic.length,
     });
     return heuristic;
   }

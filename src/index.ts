@@ -114,6 +114,13 @@ async function runHybridRecall(params: {
 }> {
   const local = resolveLocalTools(params.api, params.ctx);
   if (!local.searchTool) {
+    params.log.warn("memory_braid.search.skip", {
+      runId: params.runId,
+      reason: "local_search_tool_unavailable",
+      agentId: params.ctx.agentId,
+      sessionKey: params.ctx.sessionKey,
+      workspaceHash: workspaceHashFromDir(params.ctx.workspaceDir),
+    });
     return { local: [], mem0: [], merged: [] };
   }
 
@@ -453,9 +460,16 @@ const memoryBraidPlugin = {
       }
 
       let persisted = 0;
+      let dedupeSkipped = 0;
+      let entityAnnotatedCandidates = 0;
+      let totalEntitiesAttached = 0;
+      let mem0AddAttempts = 0;
+      let mem0AddWithId = 0;
+      let mem0AddWithoutId = 0;
       for (const candidate of candidates) {
         const hash = sha256(normalizeForHash(candidate.text));
         if (dedupe.seen[hash]) {
+          dedupeSkipped += 1;
           continue;
         }
         dedupe.seen[hash] = now;
@@ -478,28 +492,53 @@ const memoryBraidPlugin = {
             runId,
           });
           if (entities.length > 0) {
+            entityAnnotatedCandidates += 1;
+            totalEntitiesAttached += entities.length;
             metadata.entityUris = entities.map((entity) => entity.canonicalUri);
             metadata.entities = entities;
           }
         }
 
-        await mem0.addMemory({
+        mem0AddAttempts += 1;
+        const addResult = await mem0.addMemory({
           text: candidate.text,
           scope,
           metadata,
           runId,
         });
+        if (addResult.id) {
+          mem0AddWithId += 1;
+        } else {
+          mem0AddWithoutId += 1;
+          log.warn("memory_braid.capture.persist", {
+            runId,
+            reason: "mem0_add_missing_id",
+            workspaceHash: scope.workspaceHash,
+            agentId: scope.agentId,
+            sessionKey: scope.sessionKey,
+            contentHashPrefix: hash.slice(0, 12),
+            category: candidate.category,
+          });
+        }
         persisted += 1;
       }
 
       await writeCaptureDedupeState(statePaths, dedupe);
       log.debug("memory_braid.capture.persist", {
         runId,
+        mode: cfg.capture.mode,
         workspaceHash: scope.workspaceHash,
         agentId: scope.agentId,
         sessionKey: scope.sessionKey,
         candidates: candidates.length,
+        dedupeSkipped,
         persisted,
+        mem0AddAttempts,
+        mem0AddWithId,
+        mem0AddWithoutId,
+        entityExtractionEnabled: cfg.entityExtraction.enabled,
+        entityAnnotatedCandidates,
+        totalEntitiesAttached,
       }, true);
     });
 
@@ -526,6 +565,24 @@ const memoryBraidPlugin = {
           runId,
           stateDir: ctx.stateDir,
           targets: targets.length,
+        });
+        log.info("memory_braid.config", {
+          runId,
+          mem0Mode: cfg.mem0.mode,
+          captureEnabled: cfg.capture.enabled,
+          captureMode: cfg.capture.mode,
+          captureMaxItemsPerRun: cfg.capture.maxItemsPerRun,
+          captureMlProvider: cfg.capture.ml.provider ?? "unset",
+          captureMlModel: cfg.capture.ml.model ?? "unset",
+          entityExtractionEnabled: cfg.entityExtraction.enabled,
+          entityProvider: cfg.entityExtraction.provider,
+          entityModel: cfg.entityExtraction.model,
+          entityMinScore: cfg.entityExtraction.minScore,
+          entityMaxPerMemory: cfg.entityExtraction.maxEntitiesPerMemory,
+          entityWarmupOnStartup: cfg.entityExtraction.startup.downloadOnStartup,
+          debugEnabled: cfg.debug.enabled,
+          debugIncludePayloads: cfg.debug.includePayloads,
+          debugSamplingRate: cfg.debug.logSamplingRate,
         });
 
         // Bootstrap is async by design so tool availability is not blocked.
