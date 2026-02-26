@@ -24,7 +24,7 @@ import {
   writeStatsState,
 } from "./state.js";
 import type { LifecycleEntry, MemoryBraidResult, ScopeKey } from "./types.js";
-import { normalizeForHash, sha256 } from "./chunking.js";
+import { normalizeForHash, normalizeWhitespace, sha256 } from "./chunking.js";
 
 function jsonToolResult(payload: unknown) {
   return {
@@ -223,6 +223,17 @@ function isGenericUserSummary(text: string): boolean {
     /^(the user|user|usuario)\b/.test(normalized) ||
     /\b(user|usuario)\s+(asked|wants|needs|prefers|likes|said)\b/.test(normalized)
   );
+}
+
+function sanitizeRecallQuery(text: string): string {
+  if (!text) {
+    return "";
+  }
+  const withoutInjectedMemories = text.replace(
+    /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi,
+    " ",
+  );
+  return normalizeWhitespace(withoutInjectedMemories);
 }
 
 function applyMem0QualityAdjustments(params: {
@@ -1220,6 +1231,10 @@ const memoryBraidPlugin = {
 
     api.on("before_agent_start", async (event, ctx) => {
       const runId = log.newRunId();
+      const recallQuery = sanitizeRecallQuery(event.prompt);
+      if (!recallQuery) {
+        return;
+      }
       const toolCtx: OpenClawPluginToolContext = {
         config: api.config,
         workspaceDir: ctx.workspaceDir,
@@ -1235,17 +1250,17 @@ const memoryBraidPlugin = {
         log,
         ctx: toolCtx,
         statePaths: runtimeStatePaths,
-        query: event.prompt,
+        query: recallQuery,
         args: {
-          query: event.prompt,
+          query: recallQuery,
           maxResults: cfg.recall.maxResults,
         },
         runId,
       });
 
       const selected = selectMemoriesForInjection({
-        query: event.prompt,
-        results: recall.merged,
+        query: recallQuery,
+        results: recall.mem0,
         limit: cfg.recall.injectTopK,
       });
       if (selected.injected.length === 0) {
@@ -1256,6 +1271,7 @@ const memoryBraidPlugin = {
           sessionKey: scope.sessionKey,
           workspaceHash: scope.workspaceHash,
           count: 0,
+          source: "mem0",
           queryTokens: selected.queryTokens,
           filteredOut: selected.filteredOut,
           genericRejected: selected.genericRejected,
@@ -1272,6 +1288,7 @@ const memoryBraidPlugin = {
         sessionKey: scope.sessionKey,
         workspaceHash: scope.workspaceHash,
         count: selected.injected.length,
+        source: "mem0",
         queryTokens: selected.queryTokens,
         filteredOut: selected.filteredOut,
         genericRejected: selected.genericRejected,

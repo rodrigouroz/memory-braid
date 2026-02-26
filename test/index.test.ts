@@ -26,6 +26,7 @@ function createApi(params?: {
   stateDir?: string;
   pluginConfig?: Record<string, unknown>;
   config?: Record<string, unknown>;
+  localSearchResults?: unknown[];
 }) {
   const tools: Array<{ factory: unknown; options?: unknown }> = [];
   const hooks: Array<{ name: string; handler: unknown }> = [];
@@ -58,7 +59,7 @@ function createApi(params?: {
           name: "memory_search",
           parameters: {},
           execute: async () => ({
-            details: { results: [] },
+            details: { results: params?.localSearchResults ?? [] },
             content: [{ type: "text", text: "{}" }],
           }),
         }),
@@ -264,6 +265,47 @@ describe("memory-braid plugin", () => {
     expect(result && "prependContext" in result ? result.prependContext : "").not.toContain(
       "reembolso",
     );
+  });
+
+  it("injects only mem0 recall and ignores local-only matches", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
+    const { api, hooks } = createApi({
+      localSearchResults: [
+        {
+          source: "local",
+          path: "/tmp/memory/2026-02-26.md",
+          snippet: "User asked about Lewis Hamilton updates and F1 race timing.",
+          score: 0.99,
+        },
+      ],
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    expect(beforeAgentStart).toBeTypeOf("function");
+
+    const result = await beforeAgentStart!(
+      {
+        prompt: "Please help me save my hotcake recipe.",
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
   });
 
   it("downranks stale low-overlap task memories before merge", async () => {

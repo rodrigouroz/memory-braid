@@ -89,11 +89,40 @@ type NormalizedEntityToken = {
   end?: number;
 };
 
+const ENTITY_CONNECTOR_WORDS = new Set([
+  "and",
+  "da",
+  "de",
+  "del",
+  "la",
+  "las",
+  "los",
+  "of",
+  "the",
+  "y",
+]);
+const ENTITY_MAX_MERGED_WORDS = 3;
+
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return undefined;
   }
   return value;
+}
+
+function splitEntityWords(text: string): string[] {
+  return text.match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function isLikelyNoisyShortWord(word: string): boolean {
+  const normalized = word.toLowerCase();
+  if (normalized.length >= 3) {
+    return false;
+  }
+  if (ENTITY_CONNECTOR_WORDS.has(normalized)) {
+    return false;
+  }
+  return !/^[A-Z]\.?$/.test(word);
 }
 
 function joinEntityText(left: NormalizedEntityToken, right: NormalizedEntityToken): string {
@@ -108,8 +137,29 @@ function joinEntityText(left: NormalizedEntityToken, right: NormalizedEntityToke
   return `${left.text} ${right.text}`;
 }
 
-function shouldMergeEntityTokens(left: NormalizedEntityToken, right: NormalizedEntityToken): boolean {
+function shouldMergeEntityTokens(
+  left: NormalizedEntityToken,
+  right: NormalizedEntityToken,
+  sourceText?: string,
+): boolean {
   if (left.type !== right.type || !left.text || !right.text) {
+    return false;
+  }
+
+  const leftWords = splitEntityWords(left.text);
+  const rightWords = splitEntityWords(right.text);
+  if (leftWords.length === 0 || rightWords.length === 0) {
+    return false;
+  }
+  if (leftWords.length + rightWords.length > ENTITY_MAX_MERGED_WORDS) {
+    return false;
+  }
+  const leftLastWord = leftWords[leftWords.length - 1];
+  const rightFirstWord = rightWords[0];
+  if (!leftLastWord || !rightFirstWord) {
+    return false;
+  }
+  if (isLikelyNoisyShortWord(leftLastWord) || isLikelyNoisyShortWord(rightFirstWord)) {
     return false;
   }
 
@@ -120,7 +170,16 @@ function shouldMergeEntityTokens(left: NormalizedEntityToken, right: NormalizedE
     if (gap < 0) {
       return false;
     }
-    return gap <= 1;
+    if (gap > 1) {
+      return false;
+    }
+    if (sourceText && gap > 0) {
+      const between = sourceText.slice(leftEnd, rightStart);
+      if (between && /[^\s]/u.test(between)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   if (/[.,!?;:]$/.test(left.text) || /^[.,!?;:]/.test(right.text)) {
@@ -129,7 +188,10 @@ function shouldMergeEntityTokens(left: NormalizedEntityToken, right: NormalizedE
   return true;
 }
 
-function collapseAdjacentEntityTokens(tokens: NormalizedEntityToken[]): NormalizedEntityToken[] {
+function collapseAdjacentEntityTokens(
+  tokens: NormalizedEntityToken[],
+  sourceText?: string,
+): NormalizedEntityToken[] {
   if (tokens.length <= 1) {
     return tokens;
   }
@@ -137,7 +199,7 @@ function collapseAdjacentEntityTokens(tokens: NormalizedEntityToken[]): Normaliz
   const collapsed: NormalizedEntityToken[] = [];
   for (const token of tokens) {
     const previous = collapsed[collapsed.length - 1];
-    if (!previous || !shouldMergeEntityTokens(previous, token)) {
+    if (!previous || !shouldMergeEntityTokens(previous, token, sourceText)) {
       collapsed.push({ ...token });
       continue;
     }
@@ -416,7 +478,7 @@ export class EntityExtractionManager {
       });
     }
 
-    const collapsed = collapseAdjacentEntityTokens(normalized);
+    const collapsed = collapseAdjacentEntityTokens(normalized, params.text);
     const deduped = new Map<string, ExtractedEntity>();
     for (const token of collapsed) {
       const canonicalUri = buildCanonicalEntityUri(token.type, token.text);

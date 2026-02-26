@@ -49,4 +49,31 @@ describe("extractCandidates role filtering", () => {
     expect(candidates.some((entry) => entry.text.includes("prefer black coffee"))).toBe(true);
     expect(candidates.some((entry) => entry.text.includes("deploy every Friday"))).toBe(true);
   });
+
+  it("skips imported feed-style user text from heuristic capture", async () => {
+    const cfg = parseConfig({
+      capture: {
+        mode: "local",
+      },
+    });
+    const log = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const candidates = await extractCandidates({
+      messages: [
+        {
+          role: "user",
+          content:
+            "Remember that System: [n8n/rss] Lewis Hamilton wins and market alerts are firing.",
+        },
+        {
+          role: "user",
+          content: "Remember that I prefer black coffee in the morning.",
+        },
+      ],
+      cfg,
+      log,
+    });
+
+    expect(candidates.some((entry) => entry.text.includes("n8n/rss"))).toBe(false);
+    expect(candidates.some((entry) => entry.text.includes("prefer black coffee"))).toBe(true);
+  });
 });

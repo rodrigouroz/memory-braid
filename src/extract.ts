@@ -12,6 +12,34 @@ const HEURISTIC_PATTERNS = [
   /my name is|i am|contact me at|email is|phone is/i,
   /deadline|due date|todo|action item|follow up/i,
 ];
+const HEURISTIC_LOOKBACK_MULTIPLIER = 4;
+const HEURISTIC_MIN_LOOKBACK_MESSAGES = 12;
+const FEED_TAG_PATTERN = /\[(?:n8n|rss|alert|news|cron|slack|discord|telegram|email|github|jira)[^[]*]/i;
+const ROLE_LABEL_PATTERN = /\b(?:assistant|system|tool|developer)\s*:/gi;
+
+function isLikelyFeedOrImportedText(text: string): boolean {
+  if (FEED_TAG_PATTERN.test(text)) {
+    return true;
+  }
+
+  const roleLabels = text.match(ROLE_LABEL_PATTERN)?.length ?? 0;
+  if (roleLabels >= 2) {
+    return true;
+  }
+
+  const lines = text
+    .split(/\r?\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return false;
+  }
+
+  const rolePrefixedLines = lines.filter((line) =>
+    /^(assistant|system|tool|developer|user)\s*:/i.test(line),
+  ).length;
+  return rolePrefixedLines >= 2;
+}
 
 function extractMessageText(content: unknown): string {
   if (typeof content === "string") {
@@ -98,13 +126,18 @@ function pickHeuristicCandidates(
 ): ExtractedCandidate[] {
   const out: ExtractedCandidate[] = [];
   const seen = new Set<string>();
+  const lookback = Math.max(HEURISTIC_MIN_LOOKBACK_MESSAGES, maxItems * HEURISTIC_LOOKBACK_MULTIPLIER);
+  const startIndex = Math.max(0, messages.length - lookback);
 
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
+  for (let i = messages.length - 1; i >= startIndex; i -= 1) {
     const message = messages[i];
     if (!message || (message.role !== "user" && message.role !== "assistant")) {
       continue;
     }
     if (message.text.length < 20 || message.text.length > 3000) {
+      continue;
+    }
+    if (isLikelyFeedOrImportedText(message.text)) {
       continue;
     }
 

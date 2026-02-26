@@ -102,4 +102,34 @@ describe("entity extraction helpers", () => {
       "entity://location/argentina",
     ]);
   });
+
+  it("prevents noisy long-chain merges while keeping clean multi-word locations", async () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        minScore: 0.5,
+      },
+    });
+    const logger = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const manager = new EntityExtractionManager(cfg.entityExtraction, logger);
+    (manager as unknown as { ensurePipeline: () => Promise<unknown> }).ensurePipeline = async () =>
+      async () => [
+        { word: "Go", entity_group: "LOC", score: 0.9, start: 0, end: 2 },
+        { word: "rton", entity_group: "LOC", score: 0.9, start: 3, end: 7 },
+        { word: "dent", entity_group: "LOC", score: 0.9, start: 8, end: 12 },
+        { word: "on", entity_group: "LOC", score: 0.9, start: 13, end: 15 },
+        { word: "America", entity_group: "LOC", score: 0.9, start: 16, end: 23 },
+        { word: "Buenos", entity_group: "LOC", score: 0.95, start: 25, end: 31 },
+        { word: "Aires", entity_group: "LOC", score: 0.93, start: 32, end: 37 },
+      ];
+
+    const entities = await manager.extract({
+      text: "Go rton dent on America, Buenos Aires.",
+      runId: "test-run",
+    });
+
+    const uris = entities.map((entity) => entity.canonicalUri);
+    expect(uris).toContain("entity://location/buenos-aires");
+    expect(uris).not.toContain("entity://location/go-rton-dent-on-america-buenos-aires");
+  });
 });
