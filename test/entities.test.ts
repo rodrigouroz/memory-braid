@@ -45,5 +45,61 @@ describe("entity extraction helpers", () => {
       path.join("/tmp/openclaw-state", "memory-braid", "models", "entity-extraction"),
     );
   });
-});
 
+  it("merges adjacent multi-word location tokens into one entity", async () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        minScore: 0.5,
+      },
+    });
+    const logger = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const manager = new EntityExtractionManager(cfg.entityExtraction, logger);
+    (manager as unknown as { ensurePipeline: () => Promise<unknown> }).ensurePipeline = async () =>
+      async () => [
+        { word: "Buenos", entity_group: "LOC", score: 0.99, start: 10, end: 16 },
+        { word: "Aires", entity_group: "LOC", score: 0.97, start: 17, end: 22 },
+      ];
+
+    const entities = await manager.extract({
+      text: "I live in Buenos Aires.",
+      runId: "test-run",
+    });
+
+    expect(entities).toEqual([
+      {
+        text: "Buenos Aires",
+        type: "location",
+        score: 0.97,
+        canonicalUri: "entity://location/buenos-aires",
+      },
+    ]);
+  });
+
+  it("does not merge same-type tokens across punctuation gaps", async () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        minScore: 0.5,
+      },
+    });
+    const logger = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const manager = new EntityExtractionManager(cfg.entityExtraction, logger);
+    (manager as unknown as { ensurePipeline: () => Promise<unknown> }).ensurePipeline = async () =>
+      async () => [
+        { word: "Buenos", entity_group: "LOC", score: 0.99, start: 10, end: 16 },
+        { word: "Aires", entity_group: "LOC", score: 0.97, start: 17, end: 22 },
+        { word: "Argentina", entity_group: "LOC", score: 0.95, start: 24, end: 33 },
+      ];
+
+    const entities = await manager.extract({
+      text: "I live in Buenos Aires, Argentina.",
+      runId: "test-run",
+    });
+
+    expect(entities.map((entity) => entity.canonicalUri)).toEqual([
+      "entity://location/buenos-aires",
+      "entity://location/argentina",
+    ]);
+  });
+});

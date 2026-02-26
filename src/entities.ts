@@ -11,6 +11,8 @@ type NerRecord = {
   entity_group?: unknown;
   entity?: unknown;
   score?: unknown;
+  start?: unknown;
+  end?: unknown;
 };
 
 export type ExtractedEntity = {
@@ -77,6 +79,76 @@ function normalizeEntityText(raw: unknown): string {
     return "";
   }
   return normalizeWhitespace(raw.replace(/^##/, "").replace(/^▁/, ""));
+}
+
+type NormalizedEntityToken = {
+  text: string;
+  type: ExtractedEntity["type"];
+  score: number;
+  start?: number;
+  end?: number;
+};
+
+function asFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function joinEntityText(left: NormalizedEntityToken, right: NormalizedEntityToken): string {
+  const leftEnd = left.end;
+  const rightStart = right.start;
+  if (typeof leftEnd === "number" && typeof rightStart === "number") {
+    const gap = rightStart - leftEnd;
+    if (gap <= 0) {
+      return `${left.text}${right.text}`;
+    }
+  }
+  return `${left.text} ${right.text}`;
+}
+
+function shouldMergeEntityTokens(left: NormalizedEntityToken, right: NormalizedEntityToken): boolean {
+  if (left.type !== right.type || !left.text || !right.text) {
+    return false;
+  }
+
+  const leftEnd = left.end;
+  const rightStart = right.start;
+  if (typeof leftEnd === "number" && typeof rightStart === "number") {
+    const gap = rightStart - leftEnd;
+    if (gap < 0) {
+      return false;
+    }
+    return gap <= 1;
+  }
+
+  if (/[.,!?;:]$/.test(left.text) || /^[.,!?;:]/.test(right.text)) {
+    return false;
+  }
+  return true;
+}
+
+function collapseAdjacentEntityTokens(tokens: NormalizedEntityToken[]): NormalizedEntityToken[] {
+  if (tokens.length <= 1) {
+    return tokens;
+  }
+
+  const collapsed: NormalizedEntityToken[] = [];
+  for (const token of tokens) {
+    const previous = collapsed[collapsed.length - 1];
+    if (!previous || !shouldMergeEntityTokens(previous, token)) {
+      collapsed.push({ ...token });
+      continue;
+    }
+
+    previous.text = normalizeWhitespace(joinEntityText(previous, token));
+    previous.score = Math.min(previous.score, token.score);
+    previous.start = typeof previous.start === "number" ? previous.start : token.start;
+    previous.end = typeof token.end === "number" ? token.end : previous.end;
+  }
+
+  return collapsed;
 }
 
 type EntityExtractionOptions = {
@@ -319,7 +391,7 @@ export class EntityExtractionManager {
     });
     const rows = Array.isArray(raw) ? raw : [];
 
-    const deduped = new Map<string, ExtractedEntity>();
+    const normalized: NormalizedEntityToken[] = [];
     for (const row of rows) {
       if (!row || typeof row !== "object") {
         continue;
@@ -335,13 +407,25 @@ export class EntityExtractionManager {
       }
 
       const type = normalizeEntityType(record.entity_group ?? record.entity);
-      const canonicalUri = buildCanonicalEntityUri(type, entityText);
+      normalized.push({
+        text: entityText,
+        type,
+        score,
+        start: asFiniteNumber(record.start),
+        end: asFiniteNumber(record.end),
+      });
+    }
+
+    const collapsed = collapseAdjacentEntityTokens(normalized);
+    const deduped = new Map<string, ExtractedEntity>();
+    for (const token of collapsed) {
+      const canonicalUri = buildCanonicalEntityUri(token.type, token.text);
       const current = deduped.get(canonicalUri);
-      if (!current || score > current.score) {
+      if (!current || token.score > current.score) {
         deduped.set(canonicalUri, {
-          text: entityText,
-          type,
-          score,
+          text: token.text,
+          type: token.type,
+          score: token.score,
           canonicalUri,
         });
       }
