@@ -553,6 +553,7 @@ Key events:
 - `memory_braid.mem0.request|response|error`
 
 `debug.includePayloads=true` includes payload fields; otherwise sensitive text fields are omitted.
+`memory_braid.search.inject` now logs `injectedTextPreview` when payloads are enabled.
 
 Traceability tips:
 

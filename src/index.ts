@@ -918,6 +918,7 @@ const memoryBraidPlugin = {
         return;
       }
 
+      const prependContext = formatRelevantMemories(injected, cfg.debug.maxSnippetChars);
       const scope = resolveScopeFromHookContext(ctx);
       log.debug("memory_braid.search.inject", {
         runId,
@@ -925,10 +926,11 @@ const memoryBraidPlugin = {
         sessionKey: scope.sessionKey,
         workspaceHash: scope.workspaceHash,
         count: injected.length,
+        injectedTextPreview: prependContext,
       });
 
       return {
-        prependContext: formatRelevantMemories(injected, cfg.debug.maxSnippetChars),
+        prependContext,
       };
     });
 
