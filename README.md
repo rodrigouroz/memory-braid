@@ -240,6 +240,8 @@ Memory Braid supports two self-hosted setups:
    - `embedder` (provider + credentials/model)
    - `vectorStore` (provider + connection/config)
    - `llm` (provider + model; used by Mem0 OSS internals)
+   - Partial `ossConfig` is safe: Memory Braid deep-merges your values over OSS defaults.
+     - If a section provider changes (for example `embedder.provider: "ollama"`), that section is replaced instead of mixed.
 3. Restart OpenClaw.
 4. Send at least one message to trigger capture/recall.
 5. Check logs for:

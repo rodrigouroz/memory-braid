@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyOssStorageDefaults,
   isMem0DeleteNotFoundError,
+  mergeOssConfigWithDefaults,
   resolveDefaultOssStoragePaths,
   resolveOssMemoryCtor,
 } from "../src/mem0-client.js";
@@ -108,6 +109,85 @@ describe("mem0 oss storage defaults", () => {
     expect(source).toEqual(original);
     const vector = cfg.vectorStore as { config?: { dbPath?: string } };
     expect(vector.config?.dbPath).toBe(path.join("/tmp/openclaw-state", "memory-braid", "mem0-vector-store.db"));
+  });
+});
+
+describe("mem0 oss config merge", () => {
+  it("keeps default embedder when override only customizes vector dbPath", () => {
+    const defaults = {
+      embedder: {
+        provider: "openai",
+        config: {
+          apiKey: "sk-default",
+          model: "text-embedding-3-small",
+        },
+      },
+      vectorStore: {
+        provider: "memory",
+        config: {
+          collectionName: "memories",
+          dimension: 1536,
+          dbPath: "/default/vector.db",
+        },
+      },
+    };
+
+    const merged = mergeOssConfigWithDefaults(defaults, {
+      vectorStore: {
+        config: {
+          dbPath: "/custom/vector.db",
+        },
+      },
+    });
+
+    expect(merged).toEqual({
+      embedder: {
+        provider: "openai",
+        config: {
+          apiKey: "sk-default",
+          model: "text-embedding-3-small",
+        },
+      },
+      vectorStore: {
+        provider: "memory",
+        config: {
+          collectionName: "memories",
+          dimension: 1536,
+          dbPath: "/custom/vector.db",
+        },
+      },
+    });
+    expect(defaults.vectorStore.config.dbPath).toBe("/default/vector.db");
+  });
+
+  it("replaces provider sections when provider changes", () => {
+    const defaults = {
+      embedder: {
+        provider: "openai",
+        config: {
+          apiKey: "sk-default",
+          model: "text-embedding-3-small",
+        },
+      },
+    };
+
+    const merged = mergeOssConfigWithDefaults(defaults, {
+      embedder: {
+        provider: "ollama",
+        config: {
+          model: "nomic-embed-text",
+        },
+      },
+    });
+
+    expect(merged).toEqual({
+      embedder: {
+        provider: "ollama",
+        config: {
+          model: "nomic-embed-text",
+        },
+      },
+    });
   });
 });
 

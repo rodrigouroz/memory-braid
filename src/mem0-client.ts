@@ -112,6 +112,64 @@ function asNonEmptyString(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function cloneConfigValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => cloneConfigValue(entry));
+  }
+  if (isObjectLike(value)) {
+    return cloneConfigRecord(value);
+  }
+  return value;
+}
+
+function cloneConfigRecord(value: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = cloneConfigValue(entry);
+  }
+  return out;
+}
+
+function shouldReplaceProviderSection(
+  baseValue: Record<string, unknown>,
+  overrideValue: Record<string, unknown>,
+): boolean {
+  const baseProvider = asNonEmptyString(baseValue.provider)?.toLowerCase();
+  const overrideProvider = asNonEmptyString(overrideValue.provider)?.toLowerCase();
+  return Boolean(baseProvider && overrideProvider && baseProvider !== overrideProvider);
+}
+
+function deepMergeConfigRecords(
+  baseValue: Record<string, unknown>,
+  overrideValue: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = cloneConfigRecord(baseValue);
+  for (const [key, overrideEntry] of Object.entries(overrideValue)) {
+    if (typeof overrideEntry === "undefined") {
+      continue;
+    }
+    const currentBase = merged[key];
+    if (isObjectLike(currentBase) && isObjectLike(overrideEntry)) {
+      merged[key] = shouldReplaceProviderSection(currentBase, overrideEntry)
+        ? cloneConfigRecord(overrideEntry)
+        : deepMergeConfigRecords(currentBase, overrideEntry);
+      continue;
+    }
+    merged[key] = cloneConfigValue(overrideEntry);
+  }
+  return merged;
+}
+
+export function mergeOssConfigWithDefaults(
+  defaults: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!isLikelyOssConfig(override)) {
+    return cloneConfigRecord(defaults);
+  }
+  return deepMergeConfigRecords(defaults, override);
+}
+
 function asOssMemoryCtor(value: unknown): OssMemoryCtor | undefined {
   if (typeof value !== "function") {
     return undefined;
@@ -424,12 +482,11 @@ export class Mem0Adapter {
         );
       }
 
-      const providedConfig = this.cfg.mem0.ossConfig;
+      const providedConfig = asRecord(this.cfg.mem0.ossConfig);
       const hasCustomConfig = isLikelyOssConfig(providedConfig);
-      const baseConfig = hasCustomConfig
-        ? { ...providedConfig }
-        : buildDefaultOssConfig(this.cfg, this.stateDir);
-      const configToUse = applyOssStorageDefaults(baseConfig, this.stateDir);
+      const defaultConfig = buildDefaultOssConfig(this.cfg, this.stateDir);
+      const mergedConfig = mergeOssConfigWithDefaults(defaultConfig, providedConfig);
+      const configToUse = applyOssStorageDefaults(mergedConfig, this.stateDir);
       await ensureSqliteParentDirs(configToUse);
 
       this.ossClient = new Memory(configToUse);
