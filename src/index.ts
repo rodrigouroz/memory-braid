@@ -613,37 +613,39 @@ const memoryBraidPlugin = {
           debugSamplingRate: cfg.debug.logSamplingRate,
         });
 
-        // Bootstrap is async by design so tool availability is not blocked.
-        void runBootstrapIfNeeded({
-          cfg,
-          mem0,
-          statePaths,
-          log,
-          targets,
-          runId,
-        }).catch((err) => {
-          log.warn("memory_braid.bootstrap.error", {
+        // Keep startup work non-blocking, but serialize bootstrap and startup reconcile
+        // so they do not contend on the same state lock.
+        void (async () => {
+          await runBootstrapIfNeeded({
+            cfg,
+            mem0,
+            statePaths,
+            log,
+            targets,
             runId,
-            error: err instanceof Error ? err.message : String(err),
+          }).catch((err) => {
+            log.warn("memory_braid.bootstrap.error", {
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
-        });
 
-        // One startup reconcile pass (non-blocking).
-        void runReconcileOnce({
-          cfg,
-          mem0,
-          statePaths,
-          log,
-          targets,
-          reason: "startup",
-          runId,
-        }).catch((err) => {
-          log.warn("memory_braid.reconcile.error", {
-            runId,
+          await runReconcileOnce({
+            cfg,
+            mem0,
+            statePaths,
+            log,
+            targets,
             reason: "startup",
-            error: err instanceof Error ? err.message : String(err),
+            runId,
+          }).catch((err) => {
+            log.warn("memory_braid.reconcile.error", {
+              runId,
+              reason: "startup",
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
-        });
+        })();
 
         if (cfg.entityExtraction.enabled && cfg.entityExtraction.startup.downloadOnStartup) {
           void entityExtraction
