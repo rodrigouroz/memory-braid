@@ -5,11 +5,30 @@ Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory s
 ## Features
 
 - Hybrid recall: local memory + Mem0, merged with weighted RRF.
-- Install-time bootstrap import: indexes existing `MEMORY.md`, `memory.md`, `memory/**/*.md`, and recent sessions.
-- Periodic reconcile: keeps remote Mem0 chunks updated and deletes stale remote chunks.
+- Capture-first Mem0 memory: plugin writes only captured memories to Mem0 (no markdown/session indexing).
 - Capture pipeline modes: `local`, `hybrid`, `ml`.
 - Optional entity extraction: multilingual NER with canonical `entity://...` URIs in memory metadata.
 - Structured debug logs for troubleshooting and tuning.
+
+## Breaking changes in 0.4.0
+
+Memory Braid `0.4.0` is intentionally simplified to capture/recall-only mode.
+
+- Removed managed indexing features:
+  - `bootstrap` config block removed.
+  - `reconcile` config block removed.
+  - startup bootstrap/reconcile flows removed.
+- Mem0 is now used only for captured memories.
+  - markdown and session indexing is no longer done by this plugin.
+  - local markdown/session retrieval remains in core/QMD via `memory_search`.
+- `/memorybraid stats` now reports capture + lifecycle only (no reconcile section).
+- Legacy Mem0 records with `metadata.sourceType` of `markdown` or `session` are ignored during Mem0 recall merge.
+
+Migration:
+
+- If you relied on bootstrap/reconcile mirroring, pin to `<0.4.0`.
+- For `0.4.0+`, remove `bootstrap` and `reconcile` from your plugin config.
+- Keep core/QMD as the source for markdown/sessions, and use Memory Braid for capture/mem0 recall/lifecycle.
 
 ## Install
 
@@ -20,7 +39,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.3.5
+openclaw plugins install memory-braid@0.4.0
 ```
 
 2. Rebuild native dependencies inside the installed extension:
@@ -127,6 +146,7 @@ Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
   "capture": {
     "enabled": true,
     "mode": "hybrid",
+    "includeAssistant": false,
     "maxItemsPerRun": 6,
     "ml": {
       "provider": "openai",
@@ -224,22 +244,20 @@ Memory Braid supports two self-hosted setups:
 4. Send at least one message to trigger capture/recall.
 5. Check logs for:
    - `memory_braid.startup`
-   - `memory_braid.bootstrap.begin|complete`
-   - `memory_braid.reconcile.begin|complete`
    - `memory_braid.mem0.request|response`
 
 ### Smoke test checklist
 
 1. Enable debug:
    - `plugins.memory-braid.debug.enabled: true`
-2. Start OpenClaw and wait for bootstrap to finish.
-3. Ask a query that should match existing memory (from `MEMORY.md` or recent sessions).
-4. Confirm `memory_search` returns merged results.
-5. Send a preference/decision statement and verify subsequent turns can recall it.
+2. Start OpenClaw.
+3. Send a preference/decision statement.
+4. Confirm later `memory_search` runs return merged local+Mem0 results.
+5. Run `/memorybraid stats` to verify capture counters increase.
 
 ### Notes
 
-- Bootstrap imports existing markdown memory + recent sessions once, then reconcile keeps remote state aligned.
+- Memory Braid 0.4.0 is capture/recall-only by design: markdown and session indexing stay in core/QMD.
 - If self-hosted infra is down, local memory tools continue working; Mem0 side degrades gracefully.
 - For Mem0 platform/API specifics, see official docs: [Mem0 OSS quickstart](https://docs.mem0.ai/open-source/node-quickstart) and [Mem0 API reference](https://docs.mem0.ai/api-reference).
 
@@ -384,7 +402,6 @@ Use this preset when:
 3. Start OpenClaw with `debug.enabled: true` and verify:
    - `memory_braid.startup`
    - `memory_braid.mem0.response` with `mode: "oss"`
-   - `memory_braid.bootstrap.complete`
 
 ## Recommended config
 
@@ -404,23 +421,10 @@ Use this preset when:
           "mem0Weight": 1
         }
       },
-      "bootstrap": {
-        "enabled": true,
-        "includeMarkdown": true,
-        "includeSessions": true,
-        "sessionLookbackDays": 90,
-        "batchSize": 50,
-        "concurrency": 3
-      },
-      "reconcile": {
-        "enabled": true,
-        "intervalMinutes": 30,
-        "batchSize": 100,
-        "deleteStale": true
-      },
       "capture": {
         "enabled": true,
         "mode": "hybrid",
+        "includeAssistant": false,
         "maxItemsPerRun": 6,
         "ml": {
           "provider": "openai",
@@ -443,6 +447,15 @@ Use this preset when:
         "lexical": { "minJaccard": 0.3 },
         "semantic": { "enabled": true, "minScore": 0.92 }
       },
+      "timeDecay": {
+        "enabled": false
+      },
+      "lifecycle": {
+        "enabled": false,
+        "captureTtlDays": 90,
+        "cleanupIntervalMinutes": 360,
+        "reinforceOnRecall": true
+      },
       "debug": {
         "enabled": false,
         "includePayloads": false,
@@ -460,17 +473,29 @@ Capture defaults are:
 
 - `capture.enabled`: `true`
 - `capture.mode`: `"local"`
+- `capture.includeAssistant`: `false` (default user-only capture)
 - `capture.maxItemsPerRun`: `6`
 - `capture.ml.provider`: unset
 - `capture.ml.model`: unset
 - `capture.ml.timeoutMs`: `2500`
+- `timeDecay.enabled`: `false`
+- `lifecycle.enabled`: `false`
+- `lifecycle.captureTtlDays`: `90`
+- `lifecycle.cleanupIntervalMinutes`: `360`
+- `lifecycle.reinforceOnRecall`: `true`
 
 Important behavior:
 
 - `capture.mode = "local"`: heuristic-only extraction.
 - `capture.mode = "hybrid"`: heuristic extraction + ML enrichment when ML config is set.
 - `capture.mode = "ml"`: ML-first extraction; falls back to heuristic if ML config/call is unavailable.
+- `capture.includeAssistant = false` (default): only `user` messages are considered for capture.
+- `capture.includeAssistant = true`: both `user` and `assistant` messages are considered for capture.
 - ML calls run only when both `capture.ml.provider` and `capture.ml.model` are set.
+- `timeDecay.enabled = true`: applies temporal decay to Mem0 results using Memory Core's `agents.*.memorySearch.query.hybrid.temporalDecay` settings.
+- If Memory Core temporal decay is disabled, Mem0 decay is skipped even when `timeDecay.enabled = true`.
+- `lifecycle.enabled = true`: tracks captured Mem0 IDs, applies TTL cleanup, and exposes `/memorybraid cleanup`.
+- `lifecycle.reinforceOnRecall = true`: successful recalls refresh lifecycle timestamps, extending TTL survival for frequently used memories.
 
 ## Entity extraction defaults
 
@@ -493,6 +518,8 @@ When enabled:
 Warmup command:
 
 - `/memorybraid status`
+- `/memorybraid stats`
+- `/memorybraid cleanup`
 - `/memorybraid warmup`
 - `/memorybraid warmup --force`
 
@@ -516,10 +543,10 @@ Key events:
 
 - `memory_braid.startup`
 - `memory_braid.config`
-- `memory_braid.bootstrap.begin|complete|error`
-- `memory_braid.reconcile.begin|progress|complete|error`
 - `memory_braid.search.local|mem0|merge|inject|skip`
+- `memory_braid.search.mem0_decay`
 - `memory_braid.capture.extract|ml|persist|skip`
+- `memory_braid.lifecycle.reinforce|cleanup`
 - `memory_braid.entity.model_load|warmup|extract`
 - `memory_braid.mem0.request|response|error`
 

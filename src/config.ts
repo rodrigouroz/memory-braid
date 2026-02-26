@@ -21,6 +21,7 @@ export type MemoryBraidConfig = {
   capture: {
     enabled: boolean;
     mode: "local" | "hybrid" | "ml";
+    includeAssistant: boolean;
     maxItemsPerRun: number;
     ml: {
       provider?: "openai" | "anthropic" | "gemini";
@@ -39,21 +40,6 @@ export type MemoryBraidConfig = {
       warmupText: string;
     };
   };
-  bootstrap: {
-    enabled: boolean;
-    startupMode: "async";
-    includeMarkdown: boolean;
-    includeSessions: boolean;
-    sessionLookbackDays: number;
-    batchSize: number;
-    concurrency: number;
-  };
-  reconcile: {
-    enabled: boolean;
-    intervalMinutes: number;
-    batchSize: number;
-    deleteStale: boolean;
-  };
   dedupe: {
     lexical: {
       minJaccard: number;
@@ -62,6 +48,15 @@ export type MemoryBraidConfig = {
       enabled: boolean;
       minScore: number;
     };
+  };
+  timeDecay: {
+    enabled: boolean;
+  };
+  lifecycle: {
+    enabled: boolean;
+    captureTtlDays: number;
+    cleanupIntervalMinutes: number;
+    reinforceOnRecall: boolean;
   };
   debug: {
     enabled: boolean;
@@ -94,6 +89,7 @@ const DEFAULTS: MemoryBraidConfig = {
   capture: {
     enabled: true,
     mode: "local",
+    includeAssistant: false,
     maxItemsPerRun: 6,
     ml: {
       provider: undefined,
@@ -112,21 +108,6 @@ const DEFAULTS: MemoryBraidConfig = {
       warmupText: "John works at Acme in Berlin.",
     },
   },
-  bootstrap: {
-    enabled: true,
-    startupMode: "async",
-    includeMarkdown: true,
-    includeSessions: true,
-    sessionLookbackDays: 90,
-    batchSize: 50,
-    concurrency: 3,
-  },
-  reconcile: {
-    enabled: true,
-    intervalMinutes: 30,
-    batchSize: 100,
-    deleteStale: true,
-  },
   dedupe: {
     lexical: {
       minJaccard: 0.3,
@@ -135,6 +116,15 @@ const DEFAULTS: MemoryBraidConfig = {
       enabled: true,
       minScore: 0.92,
     },
+  },
+  timeDecay: {
+    enabled: false,
+  },
+  lifecycle: {
+    enabled: false,
+    captureTtlDays: 90,
+    cleanupIntervalMinutes: 360,
+    reinforceOnRecall: true,
   },
   debug: {
     enabled: false,
@@ -181,11 +171,11 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const entityExtraction = asRecord(root.entityExtraction);
   const entityStartup = asRecord(entityExtraction.startup);
   const ml = asRecord(capture.ml);
-  const bootstrap = asRecord(root.bootstrap);
-  const reconcile = asRecord(root.reconcile);
   const dedupe = asRecord(root.dedupe);
   const lexical = asRecord(dedupe.lexical);
   const semantic = asRecord(dedupe.semantic);
+  const timeDecay = asRecord(root.timeDecay);
+  const lifecycle = asRecord(root.lifecycle);
   const debug = asRecord(root.debug);
 
   const mode = mem0.mode === "oss" ? "oss" : "cloud";
@@ -218,6 +208,7 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     capture: {
       enabled: asBoolean(capture.enabled, DEFAULTS.capture.enabled),
       mode: captureMode,
+      includeAssistant: asBoolean(capture.includeAssistant, DEFAULTS.capture.includeAssistant),
       maxItemsPerRun: asInt(capture.maxItemsPerRun, DEFAULTS.capture.maxItemsPerRun, 1, 50),
       ml: {
         provider:
@@ -251,31 +242,6 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
           asString(entityStartup.warmupText) ?? DEFAULTS.entityExtraction.startup.warmupText,
       },
     },
-    bootstrap: {
-      enabled: asBoolean(bootstrap.enabled, DEFAULTS.bootstrap.enabled),
-      startupMode: "async",
-      includeMarkdown: asBoolean(bootstrap.includeMarkdown, DEFAULTS.bootstrap.includeMarkdown),
-      includeSessions: asBoolean(bootstrap.includeSessions, DEFAULTS.bootstrap.includeSessions),
-      sessionLookbackDays: asInt(
-        bootstrap.sessionLookbackDays,
-        DEFAULTS.bootstrap.sessionLookbackDays,
-        1,
-        3650,
-      ),
-      batchSize: asInt(bootstrap.batchSize, DEFAULTS.bootstrap.batchSize, 1, 1000),
-      concurrency: asInt(bootstrap.concurrency, DEFAULTS.bootstrap.concurrency, 1, 16),
-    },
-    reconcile: {
-      enabled: asBoolean(reconcile.enabled, DEFAULTS.reconcile.enabled),
-      intervalMinutes: asInt(
-        reconcile.intervalMinutes,
-        DEFAULTS.reconcile.intervalMinutes,
-        1,
-        1440,
-      ),
-      batchSize: asInt(reconcile.batchSize, DEFAULTS.reconcile.batchSize, 1, 5000),
-      deleteStale: asBoolean(reconcile.deleteStale, DEFAULTS.reconcile.deleteStale),
-    },
     dedupe: {
       lexical: {
         minJaccard: asNumber(lexical.minJaccard, DEFAULTS.dedupe.lexical.minJaccard, 0, 1),
@@ -284,6 +250,28 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
         enabled: asBoolean(semantic.enabled, DEFAULTS.dedupe.semantic.enabled),
         minScore: asNumber(semantic.minScore, DEFAULTS.dedupe.semantic.minScore, 0, 1),
       },
+    },
+    timeDecay: {
+      enabled: asBoolean(timeDecay.enabled, DEFAULTS.timeDecay.enabled),
+    },
+    lifecycle: {
+      enabled: asBoolean(lifecycle.enabled, DEFAULTS.lifecycle.enabled),
+      captureTtlDays: asInt(
+        lifecycle.captureTtlDays,
+        DEFAULTS.lifecycle.captureTtlDays,
+        1,
+        3650,
+      ),
+      cleanupIntervalMinutes: asInt(
+        lifecycle.cleanupIntervalMinutes,
+        DEFAULTS.lifecycle.cleanupIntervalMinutes,
+        1,
+        10080,
+      ),
+      reinforceOnRecall: asBoolean(
+        lifecycle.reinforceOnRecall,
+        DEFAULTS.lifecycle.reinforceOnRecall,
+      ),
     },
     debug: {
       enabled: asBoolean(debug.enabled, DEFAULTS.debug.enabled),

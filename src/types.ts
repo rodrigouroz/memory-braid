@@ -1,20 +1,9 @@
 export type MemoryBraidSource = "local" | "mem0";
 
-export type ManagedSourceType = "markdown" | "session";
-
-export type PersistedSourceType = ManagedSourceType | "capture";
-
 export type ScopeKey = {
   workspaceHash: string;
   agentId: string;
   sessionKey?: string;
-};
-
-export type TargetWorkspace = {
-  workspaceDir: string;
-  stateDir: string;
-  agentId: string;
-  workspaceHash: string;
 };
 
 export type MemoryBraidResult = {
@@ -31,61 +20,54 @@ export type MemoryBraidResult = {
   contentHash?: string;
 };
 
-export type ManifestChunk = {
-  chunkKey: string;
-  contentHash: string;
-  sourceType: ManagedSourceType;
-  text: string;
-  path: string;
-  workspaceHash: string;
-  agentId: string;
-  updatedAt: number;
-};
-
-export type IndexedEntry = {
-  chunkKey: string;
-  id?: string;
-  contentHash: string;
-  sourceType: PersistedSourceType;
-  path?: string;
-  workspaceHash: string;
-  agentId: string;
-  updatedAt: number;
-  missingCount?: number;
-};
-
-export type ReconcileState = {
-  version: 1;
-  entries: Record<string, IndexedEntry>;
-  lastRunAt?: string;
-};
-
-export type BootstrapState = {
-  version: 1;
-  completed: boolean;
-  startedAt?: string;
-  completedAt?: string;
-  lastError?: string;
-  summary?: {
-    reason: string;
-    total: number;
-    upserted: number;
-    deleted: number;
-    unchanged: number;
-  };
-};
-
 export type CaptureDedupeState = {
   version: 1;
   seen: Record<string, number>;
 };
 
-export type ReconcileSummary = {
-  reason: string;
-  total: number;
-  upserted: number;
-  deleted: number;
-  unchanged: number;
+export type LifecycleEntry = {
+  memoryId: string;
+  contentHash: string;
+  workspaceHash: string;
+  agentId: string;
+  sessionKey?: string;
+  category?: string;
+  createdAt: number;
+  lastCapturedAt: number;
+  lastRecalledAt?: number;
+  recallCount: number;
+  updatedAt: number;
+};
+
+export type LifecycleState = {
+  version: 1;
+  entries: Record<string, LifecycleEntry>;
+  lastCleanupAt?: string;
+  lastCleanupReason?: "startup" | "interval" | "command";
+  lastCleanupScanned?: number;
+  lastCleanupExpired?: number;
+  lastCleanupDeleted?: number;
+  lastCleanupFailed?: number;
+};
+
+export type CaptureStats = {
+  runs: number;
+  runsWithCandidates: number;
+  runsNoCandidates: number;
+  candidates: number;
+  dedupeSkipped: number;
+  persisted: number;
+  mem0AddAttempts: number;
+  mem0AddWithId: number;
+  mem0AddWithoutId: number;
+  entityAnnotatedCandidates: number;
+  totalEntitiesAttached: number;
+  lastRunAt?: string;
+};
+
+export type PluginStatsState = {
+  version: 1;
+  capture: CaptureStats;
 };
 
 export type ExtractedCandidate = {

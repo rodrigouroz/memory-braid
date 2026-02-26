@@ -11,17 +11,20 @@ import { MemoryBraidLogger } from "./logger.js";
 import { resolveLocalTools, runLocalGet, runLocalSearch } from "./local-memory.js";
 import { Mem0Adapter } from "./mem0-client.js";
 import { mergeWithRrf } from "./merge.js";
-import { resolveTargets, runReconcileOnce } from "./reconcile.js";
 import {
   createStatePaths,
   ensureStateDir,
   readCaptureDedupeState,
+  readLifecycleState,
+  readStatsState,
   type StatePaths,
+  withStateLock,
   writeCaptureDedupeState,
+  writeLifecycleState,
+  writeStatsState,
 } from "./state.js";
-import type { MemoryBraidResult, ScopeKey, TargetWorkspace } from "./types.js";
+import type { LifecycleEntry, MemoryBraidResult, ScopeKey } from "./types.js";
 import { normalizeForHash, sha256 } from "./chunking.js";
-import { runBootstrapIfNeeded } from "./bootstrap.js";
 
 function jsonToolResult(payload: unknown) {
   return {
@@ -95,12 +98,341 @@ function formatEntityExtractionStatus(params: {
   ].join("\n");
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+function resolveCoreTemporalDecay(params: {
+  config?: unknown;
+  agentId?: string;
+}): { enabled: boolean; halfLifeDays: number } {
+  const root = asRecord(params.config);
+  const agents = asRecord(root.agents);
+  const defaults = asRecord(agents.defaults);
+  const defaultMemorySearch = asRecord(defaults.memorySearch);
+  const defaultTemporalDecay = asRecord(asRecord(asRecord(defaultMemorySearch.query).hybrid).temporalDecay);
+
+  const requestedAgent = (params.agentId ?? "").trim().toLowerCase();
+  let agentTemporalDecay: Record<string, unknown> = {};
+  if (requestedAgent) {
+    const agentList = Array.isArray(agents.list) ? agents.list : [];
+    for (const entry of agentList) {
+      const row = asRecord(entry);
+      const rowAgentId = typeof row.id === "string" ? row.id.trim().toLowerCase() : "";
+      if (!rowAgentId || rowAgentId !== requestedAgent) {
+        continue;
+      }
+      const memorySearch = asRecord(row.memorySearch);
+      agentTemporalDecay = asRecord(asRecord(asRecord(memorySearch.query).hybrid).temporalDecay);
+      break;
+    }
+  }
+
+  const enabledRaw =
+    typeof agentTemporalDecay.enabled === "boolean"
+      ? agentTemporalDecay.enabled
+      : typeof defaultTemporalDecay.enabled === "boolean"
+        ? defaultTemporalDecay.enabled
+        : false;
+  const halfLifeRaw =
+    typeof agentTemporalDecay.halfLifeDays === "number"
+      ? agentTemporalDecay.halfLifeDays
+      : typeof defaultTemporalDecay.halfLifeDays === "number"
+        ? defaultTemporalDecay.halfLifeDays
+        : 30;
+  const halfLifeDays = Math.max(1, Math.min(3650, Math.round(halfLifeRaw)));
+
+  return {
+    enabled: enabledRaw,
+    halfLifeDays,
+  };
+}
+
+function resolveDateFromPath(pathValue?: string): number | undefined {
+  if (!pathValue) {
+    return undefined;
+  }
+  const match = /(?:^|[/\\])memory[/\\](\d{4})-(\d{2})-(\d{2})\.md$/i.exec(pathValue);
+  if (!match) {
+    return undefined;
+  }
+  const [, yearRaw, monthRaw, dayRaw] = match;
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return undefined;
+  }
+  const parsed = new Date(year, month - 1, day).getTime();
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function resolveTimestampMs(result: MemoryBraidResult): number | undefined {
+  const metadata = asRecord(result.metadata);
+  const fields = [
+    metadata.indexedAt,
+    metadata.updatedAt,
+    metadata.createdAt,
+    metadata.timestamp,
+    metadata.lastSeenAt,
+  ];
+  for (const value of fields) {
+    if (typeof value === "string") {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value > 1e12 ? value : value * 1000;
+    }
+  }
+  return resolveDateFromPath(result.path);
+}
+
+function applyTemporalDecayToMem0(params: {
+  results: MemoryBraidResult[];
+  halfLifeDays: number;
+  nowMs: number;
+}): { results: MemoryBraidResult[]; decayed: number; missingTimestamp: number } {
+  if (params.results.length === 0) {
+    return {
+      results: params.results,
+      decayed: 0,
+      missingTimestamp: 0,
+    };
+  }
+
+  const lambda = Math.LN2 / Math.max(1, params.halfLifeDays);
+  let decayed = 0;
+  let missingTimestamp = 0;
+  const out = params.results.map((result, index) => {
+    const ts = resolveTimestampMs(result);
+    if (!ts) {
+      missingTimestamp += 1;
+      return { result, index };
+    }
+    const ageDays = Math.max(0, (params.nowMs - ts) / (24 * 60 * 60 * 1000));
+    const decay = Math.exp(-lambda * ageDays);
+    decayed += 1;
+    return {
+      index,
+      result: {
+        ...result,
+        score: result.score * decay,
+      },
+    };
+  });
+
+  out.sort((left, right) => {
+    const scoreDelta = right.result.score - left.result.score;
+    if (scoreDelta !== 0) {
+      return scoreDelta;
+    }
+    return left.index - right.index;
+  });
+
+  return {
+    results: out.map((entry) => entry.result),
+    decayed,
+    missingTimestamp,
+  };
+}
+
+function resolveLifecycleReferenceTs(entry: LifecycleEntry, reinforceOnRecall: boolean): number {
+  const capturedTs = Number.isFinite(entry.lastCapturedAt)
+    ? entry.lastCapturedAt
+    : Number.isFinite(entry.createdAt)
+      ? entry.createdAt
+      : 0;
+  if (!reinforceOnRecall) {
+    return capturedTs;
+  }
+  const recalledTs = Number.isFinite(entry.lastRecalledAt) ? entry.lastRecalledAt : 0;
+  return Math.max(capturedTs, recalledTs);
+}
+
+async function reinforceLifecycleEntries(params: {
+  cfg: ReturnType<typeof parseConfig>;
+  log: MemoryBraidLogger;
+  statePaths: StatePaths;
+  runId: string;
+  scope: ScopeKey;
+  results: MemoryBraidResult[];
+}): Promise<void> {
+  if (!params.cfg.lifecycle.enabled || !params.cfg.lifecycle.reinforceOnRecall) {
+    return;
+  }
+
+  const memoryIds = Array.from(
+    new Set(
+      params.results
+        .filter((result) => result.source === "mem0" && typeof result.id === "string" && result.id)
+        .map((result) => result.id as string),
+    ),
+  );
+  if (memoryIds.length === 0) {
+    return;
+  }
+
+  const now = Date.now();
+  const updatedIds = await withStateLock(params.statePaths.stateLockFile, async () => {
+    const lifecycle = await readLifecycleState(params.statePaths);
+    const touched: string[] = [];
+
+    for (const memoryId of memoryIds) {
+      const entry = lifecycle.entries[memoryId];
+      if (!entry) {
+        continue;
+      }
+      lifecycle.entries[memoryId] = {
+        ...entry,
+        recallCount: Math.max(0, entry.recallCount ?? 0) + 1,
+        lastRecalledAt: now,
+        updatedAt: now,
+      };
+      touched.push(memoryId);
+    }
+
+    if (touched.length > 0) {
+      await writeLifecycleState(params.statePaths, lifecycle);
+    }
+
+    return touched;
+  });
+
+  if (updatedIds.length === 0) {
+    return;
+  }
+
+  params.log.debug("memory_braid.lifecycle.reinforce", {
+    runId: params.runId,
+    workspaceHash: params.scope.workspaceHash,
+    agentId: params.scope.agentId,
+    sessionKey: params.scope.sessionKey,
+    matchedResults: memoryIds.length,
+    reinforced: updatedIds.length,
+  });
+}
+
+async function runLifecycleCleanupOnce(params: {
+  cfg: ReturnType<typeof parseConfig>;
+  mem0: Mem0Adapter;
+  log: MemoryBraidLogger;
+  statePaths: StatePaths;
+  reason: "startup" | "interval" | "command";
+  runId?: string;
+}): Promise<{ scanned: number; expired: number; deleted: number; failed: number }> {
+  if (!params.cfg.lifecycle.enabled) {
+    return {
+      scanned: 0,
+      expired: 0,
+      deleted: 0,
+      failed: 0,
+    };
+  }
+
+  const now = Date.now();
+  const ttlMs = params.cfg.lifecycle.captureTtlDays * 24 * 60 * 60 * 1000;
+  const expiredCandidates = await withStateLock(params.statePaths.stateLockFile, async () => {
+    const lifecycle = await readLifecycleState(params.statePaths);
+    const expired: Array<{ memoryId: string; scope: ScopeKey }> = [];
+    const malformedIds: string[] = [];
+
+    for (const [memoryId, entry] of Object.entries(lifecycle.entries)) {
+      if (!memoryId || !entry.workspaceHash || !entry.agentId) {
+        malformedIds.push(memoryId);
+        continue;
+      }
+      const referenceTs = resolveLifecycleReferenceTs(entry, params.cfg.lifecycle.reinforceOnRecall);
+      if (!Number.isFinite(referenceTs) || referenceTs <= 0) {
+        malformedIds.push(memoryId);
+        continue;
+      }
+      if (now - referenceTs < ttlMs) {
+        continue;
+      }
+      expired.push({
+        memoryId,
+        scope: {
+          workspaceHash: entry.workspaceHash,
+          agentId: entry.agentId,
+          sessionKey: entry.sessionKey,
+        },
+      });
+    }
+
+    for (const memoryId of malformedIds) {
+      delete lifecycle.entries[memoryId];
+    }
+    if (malformedIds.length > 0) {
+      await writeLifecycleState(params.statePaths, lifecycle);
+    }
+
+    return {
+      scanned: Object.keys(lifecycle.entries).length + malformedIds.length,
+      expired,
+    };
+  });
+
+  let deleted = 0;
+  let failed = 0;
+  const deletedIds = new Set<string>();
+  for (const candidate of expiredCandidates.expired) {
+    const ok = await params.mem0.deleteMemory({
+      memoryId: candidate.memoryId,
+      scope: candidate.scope,
+      runId: params.runId,
+    });
+    if (ok) {
+      deleted += 1;
+      deletedIds.add(candidate.memoryId);
+    } else {
+      failed += 1;
+    }
+  }
+
+  await withStateLock(params.statePaths.stateLockFile, async () => {
+    const lifecycle = await readLifecycleState(params.statePaths);
+    for (const memoryId of deletedIds) {
+      delete lifecycle.entries[memoryId];
+    }
+    lifecycle.lastCleanupAt = new Date(now).toISOString();
+    lifecycle.lastCleanupReason = params.reason;
+    lifecycle.lastCleanupScanned = expiredCandidates.scanned;
+    lifecycle.lastCleanupExpired = expiredCandidates.expired.length;
+    lifecycle.lastCleanupDeleted = deleted;
+    lifecycle.lastCleanupFailed = failed;
+    await writeLifecycleState(params.statePaths, lifecycle);
+  });
+
+  params.log.debug("memory_braid.lifecycle.cleanup", {
+    runId: params.runId,
+    reason: params.reason,
+    scanned: expiredCandidates.scanned,
+    expired: expiredCandidates.expired.length,
+    deleted,
+    failed,
+  });
+
+  return {
+    scanned: expiredCandidates.scanned,
+    expired: expiredCandidates.expired.length,
+    deleted,
+    failed,
+  };
+}
+
 async function runHybridRecall(params: {
   api: OpenClawPluginApi;
   cfg: ReturnType<typeof parseConfig>;
   mem0: Mem0Adapter;
   log: MemoryBraidLogger;
   ctx: OpenClawPluginToolContext;
+  statePaths?: StatePaths | null;
   query: string;
   toolCallId?: string;
   args?: Record<string, unknown>;
@@ -151,24 +483,63 @@ async function runHybridRecall(params: {
 
   const scope = resolveScopeFromToolContext(params.ctx);
   const mem0Started = Date.now();
-  const mem0Search = await params.mem0.searchMemories({
+  const mem0Raw = await params.mem0.searchMemories({
     query: params.query,
     maxResults,
     scope,
     runId: params.runId,
   });
+  const mem0Search = mem0Raw.filter((result) => {
+    const sourceType = asRecord(result.metadata).sourceType;
+    return sourceType !== "markdown" && sourceType !== "session";
+  });
+  let mem0ForMerge = mem0Search;
+  if (params.cfg.timeDecay.enabled) {
+    const coreDecay = resolveCoreTemporalDecay({
+      config: params.ctx.config,
+      agentId: params.ctx.agentId,
+    });
+    if (coreDecay.enabled) {
+      const decayed = applyTemporalDecayToMem0({
+        results: mem0Search,
+        halfLifeDays: coreDecay.halfLifeDays,
+        nowMs: Date.now(),
+      });
+      mem0ForMerge = decayed.results;
+      params.log.debug("memory_braid.search.mem0_decay", {
+        runId: params.runId,
+        agentId: scope.agentId,
+        sessionKey: scope.sessionKey,
+        workspaceHash: scope.workspaceHash,
+        enabled: true,
+        halfLifeDays: coreDecay.halfLifeDays,
+        inputCount: mem0Search.length,
+        decayed: decayed.decayed,
+        missingTimestamp: decayed.missingTimestamp,
+      });
+    } else {
+      params.log.debug("memory_braid.search.mem0_decay", {
+        runId: params.runId,
+        agentId: scope.agentId,
+        sessionKey: scope.sessionKey,
+        workspaceHash: scope.workspaceHash,
+        enabled: false,
+        reason: "memory_core_temporal_decay_disabled",
+      });
+    }
+  }
   params.log.debug("memory_braid.search.mem0", {
     runId: params.runId,
     agentId: scope.agentId,
     sessionKey: scope.sessionKey,
     workspaceHash: scope.workspaceHash,
-    count: mem0Search.length,
+    count: mem0ForMerge.length,
     durMs: Date.now() - mem0Started,
   });
 
   const merged = mergeWithRrf({
     local: localSearch.results,
-    mem0: mem0Search,
+    mem0: mem0ForMerge,
     options: {
       rrfK: params.cfg.recall.merge.rrfK,
       localWeight: params.cfg.recall.merge.localWeight,
@@ -193,22 +564,34 @@ async function runHybridRecall(params: {
     runId: params.runId,
     workspaceHash: scope.workspaceHash,
     localCount: localSearch.results.length,
-    mem0Count: mem0Search.length,
+    mem0Count: mem0ForMerge.length,
     mergedCount: merged.length,
     dedupedCount: deduped.length,
   });
 
+  const topMerged = deduped.slice(0, maxResults);
+  if (params.statePaths) {
+    await reinforceLifecycleEntries({
+      cfg: params.cfg,
+      log: params.log,
+      statePaths: params.statePaths,
+      runId: params.runId,
+      scope,
+      results: topMerged,
+    });
+  }
+
   return {
     local: localSearch.results,
-    mem0: mem0Search,
-    merged: deduped.slice(0, maxResults),
+    mem0: mem0ForMerge,
+    merged: topMerged,
   };
 }
 
 const memoryBraidPlugin = {
   id: "memory-braid",
   name: "Memory Braid",
-  description: "Hybrid memory plugin with local + Mem0 recall, capture, bootstrap import, and reconcile",
+  description: "Hybrid memory plugin with local + Mem0 recall and capture.",
   kind: "memory" as const,
   configSchema: pluginConfigSchema,
 
@@ -221,9 +604,29 @@ const memoryBraidPlugin = {
       stateDir: initialStateDir,
     });
 
-    let serviceTimer: NodeJS.Timeout | null = null;
+    let lifecycleTimer: NodeJS.Timeout | null = null;
     let statePaths: StatePaths | null = null;
-    let targets: TargetWorkspace[] = [];
+
+    async function ensureRuntimeStatePaths(): Promise<StatePaths | null> {
+      if (statePaths) {
+        return statePaths;
+      }
+      const resolvedStateDir = api.runtime.state.resolveStateDir();
+      if (!resolvedStateDir) {
+        return null;
+      }
+
+      const next = createStatePaths(resolvedStateDir);
+      try {
+        await ensureStateDir(next);
+        statePaths = next;
+        mem0.setStateDir(resolvedStateDir);
+        entityExtraction.setStateDir(resolvedStateDir);
+        return statePaths;
+      } catch {
+        return null;
+      }
+    }
 
     api.registerTool(
       (ctx) => {
@@ -259,12 +662,14 @@ const memoryBraidPlugin = {
               });
             }
 
+            const runtimeStatePaths = await ensureRuntimeStatePaths();
             const recall = await runHybridRecall({
               api,
               cfg,
               mem0,
               log,
               ctx,
+              statePaths: runtimeStatePaths,
               query,
               toolCallId,
               args,
@@ -320,7 +725,7 @@ const memoryBraidPlugin = {
 
     api.registerCommand({
       name: "memorybraid",
-      description: "Memory Braid status and entity extraction warmup.",
+      description: "Memory Braid status, stats, lifecycle cleanup, and entity extraction warmup.",
       acceptsArgs: true,
       handler: async (ctx) => {
         const args = ctx.args?.trim() ?? "";
@@ -328,11 +733,121 @@ const memoryBraidPlugin = {
         const action = (tokens[0] ?? "status").toLowerCase();
 
         if (action === "status") {
+          const coreDecay = resolveCoreTemporalDecay({
+            config: ctx.config,
+          });
+          const paths = await ensureRuntimeStatePaths();
+          const lifecycle =
+            cfg.lifecycle.enabled && paths
+              ? await readLifecycleState(paths)
+              : { entries: {}, lastCleanupAt: undefined, lastCleanupReason: undefined };
           return {
             text: [
               `capture.mode: ${cfg.capture.mode}`,
+              `capture.includeAssistant: ${cfg.capture.includeAssistant}`,
+              `timeDecay.enabled: ${cfg.timeDecay.enabled}`,
+              `memoryCore.temporalDecay.enabled: ${coreDecay.enabled}`,
+              `memoryCore.temporalDecay.halfLifeDays: ${coreDecay.halfLifeDays}`,
+              `lifecycle.enabled: ${cfg.lifecycle.enabled}`,
+              `lifecycle.captureTtlDays: ${cfg.lifecycle.captureTtlDays}`,
+              `lifecycle.cleanupIntervalMinutes: ${cfg.lifecycle.cleanupIntervalMinutes}`,
+              `lifecycle.reinforceOnRecall: ${cfg.lifecycle.reinforceOnRecall}`,
+              `lifecycle.tracked: ${Object.keys(lifecycle.entries).length}`,
+              `lifecycle.lastCleanupAt: ${lifecycle.lastCleanupAt ?? "n/a"}`,
+              `lifecycle.lastCleanupReason: ${lifecycle.lastCleanupReason ?? "n/a"}`,
               formatEntityExtractionStatus(entityExtraction.getStatus()),
             ].join("\n\n"),
+          };
+        }
+
+        if (action === "stats") {
+          const paths = await ensureRuntimeStatePaths();
+          if (!paths) {
+            return {
+              text: "Stats unavailable: state directory is not ready.",
+              isError: true,
+            };
+          }
+
+          const stats = await readStatsState(paths);
+          const lifecycle = await readLifecycleState(paths);
+          const capture = stats.capture;
+          const mem0SuccessRate =
+            capture.mem0AddAttempts > 0
+              ? `${((capture.mem0AddWithId / capture.mem0AddAttempts) * 100).toFixed(1)}%`
+              : "n/a";
+          const mem0NoIdRate =
+            capture.mem0AddAttempts > 0
+              ? `${((capture.mem0AddWithoutId / capture.mem0AddAttempts) * 100).toFixed(1)}%`
+              : "n/a";
+          const dedupeSkipRate =
+            capture.candidates > 0
+              ? `${((capture.dedupeSkipped / capture.candidates) * 100).toFixed(1)}%`
+              : "n/a";
+
+          return {
+            text: [
+              "Memory Braid stats",
+              "",
+              "Capture:",
+              `- runs: ${capture.runs}`,
+              `- runsWithCandidates: ${capture.runsWithCandidates}`,
+              `- runsNoCandidates: ${capture.runsNoCandidates}`,
+              `- candidates: ${capture.candidates}`,
+              `- dedupeSkipped: ${capture.dedupeSkipped} (${dedupeSkipRate})`,
+              `- persisted: ${capture.persisted}`,
+              `- mem0AddAttempts: ${capture.mem0AddAttempts}`,
+              `- mem0AddWithId: ${capture.mem0AddWithId} (${mem0SuccessRate})`,
+              `- mem0AddWithoutId: ${capture.mem0AddWithoutId} (${mem0NoIdRate})`,
+              `- lastRunAt: ${capture.lastRunAt ?? "n/a"}`,
+              "",
+              "Lifecycle:",
+              `- enabled: ${cfg.lifecycle.enabled}`,
+              `- tracked: ${Object.keys(lifecycle.entries).length}`,
+              `- captureTtlDays: ${cfg.lifecycle.captureTtlDays}`,
+              `- cleanupIntervalMinutes: ${cfg.lifecycle.cleanupIntervalMinutes}`,
+              `- reinforceOnRecall: ${cfg.lifecycle.reinforceOnRecall}`,
+              `- lastCleanupAt: ${lifecycle.lastCleanupAt ?? "n/a"}`,
+              `- lastCleanupReason: ${lifecycle.lastCleanupReason ?? "n/a"}`,
+              `- lastCleanupScanned: ${lifecycle.lastCleanupScanned ?? "n/a"}`,
+              `- lastCleanupExpired: ${lifecycle.lastCleanupExpired ?? "n/a"}`,
+              `- lastCleanupDeleted: ${lifecycle.lastCleanupDeleted ?? "n/a"}`,
+              `- lastCleanupFailed: ${lifecycle.lastCleanupFailed ?? "n/a"}`,
+            ].join("\n"),
+          };
+        }
+
+        if (action === "cleanup") {
+          if (!cfg.lifecycle.enabled) {
+            return {
+              text: "Lifecycle cleanup skipped: lifecycle.enabled is false.",
+              isError: true,
+            };
+          }
+          const paths = await ensureRuntimeStatePaths();
+          if (!paths) {
+            return {
+              text: "Cleanup unavailable: state directory is not ready.",
+              isError: true,
+            };
+          }
+          const runId = log.newRunId();
+          const summary = await runLifecycleCleanupOnce({
+            cfg,
+            mem0,
+            log,
+            statePaths: paths,
+            reason: "command",
+            runId,
+          });
+          return {
+            text: [
+              "Lifecycle cleanup complete.",
+              `- scanned: ${summary.scanned}`,
+              `- expired: ${summary.expired}`,
+              `- deleted: ${summary.deleted}`,
+              `- failed: ${summary.failed}`,
+            ].join("\n"),
           };
         }
 
@@ -368,7 +883,7 @@ const memoryBraidPlugin = {
         }
 
         return {
-          text: "Usage: /memorybraid [status|warmup [--force]]",
+          text: "Usage: /memorybraid [status|stats|cleanup|warmup [--force]]",
         };
       },
     });
@@ -381,6 +896,7 @@ const memoryBraidPlugin = {
         agentId: ctx.agentId,
         sessionKey: ctx.sessionKey,
       };
+      const runtimeStatePaths = await ensureRuntimeStatePaths();
 
       const recall = await runHybridRecall({
         api,
@@ -388,6 +904,7 @@ const memoryBraidPlugin = {
         mem0,
         log,
         ctx: toolCtx,
+        statePaths: runtimeStatePaths,
         query: event.prompt,
         args: {
           query: event.prompt,
@@ -427,8 +944,18 @@ const memoryBraidPlugin = {
         log,
         runId,
       });
+      const runtimeStatePaths = await ensureRuntimeStatePaths();
 
       if (candidates.length === 0) {
+        if (runtimeStatePaths) {
+          await withStateLock(runtimeStatePaths.stateLockFile, async () => {
+            const stats = await readStatsState(runtimeStatePaths);
+            stats.capture.runs += 1;
+            stats.capture.runsNoCandidates += 1;
+            stats.capture.lastRunAt = new Date().toISOString();
+            await writeStatsState(runtimeStatePaths, stats);
+          });
+        }
         log.debug("memory_braid.capture.skip", {
           runId,
           reason: "no_candidates",
@@ -439,35 +966,7 @@ const memoryBraidPlugin = {
         return;
       }
 
-      if (!statePaths) {
-        const resolvedStateDir = api.runtime.state.resolveStateDir();
-        if (resolvedStateDir) {
-          const lazyStatePaths = createStatePaths(resolvedStateDir);
-          try {
-            await ensureStateDir(lazyStatePaths);
-            statePaths = lazyStatePaths;
-            mem0.setStateDir(resolvedStateDir);
-            entityExtraction.setStateDir(resolvedStateDir);
-            log.info("memory_braid.state.ready", {
-              runId,
-              reason: "lazy_capture",
-              stateDir: resolvedStateDir,
-            });
-          } catch (err) {
-            log.warn("memory_braid.capture.skip", {
-              runId,
-              reason: "state_init_failed",
-              workspaceHash: scope.workspaceHash,
-              agentId: scope.agentId,
-              sessionKey: scope.sessionKey,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            return;
-          }
-        }
-      }
-
-      if (!statePaths) {
+      if (!runtimeStatePaths) {
         log.warn("memory_braid.capture.skip", {
           runId,
           reason: "state_not_ready",
@@ -478,96 +977,135 @@ const memoryBraidPlugin = {
         return;
       }
 
-      const dedupe = await readCaptureDedupeState(statePaths);
-      const now = Date.now();
-      const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-      for (const [key, ts] of Object.entries(dedupe.seen)) {
-        if (now - ts > thirtyDays) {
-          delete dedupe.seen[key];
-        }
-      }
-
-      let persisted = 0;
-      let dedupeSkipped = 0;
-      let entityAnnotatedCandidates = 0;
-      let totalEntitiesAttached = 0;
-      let mem0AddAttempts = 0;
-      let mem0AddWithId = 0;
-      let mem0AddWithoutId = 0;
-      for (const candidate of candidates) {
-        const hash = sha256(normalizeForHash(candidate.text));
-        if (dedupe.seen[hash]) {
-          dedupeSkipped += 1;
-          continue;
-        }
-        dedupe.seen[hash] = now;
-
-        const metadata: Record<string, unknown> = {
-          sourceType: "capture",
-          workspaceHash: scope.workspaceHash,
-          agentId: scope.agentId,
-          sessionKey: scope.sessionKey,
-          category: candidate.category,
-          captureScore: candidate.score,
-          extractionSource: candidate.source,
-          contentHash: hash,
-          indexedAt: new Date().toISOString(),
-        };
-
-        if (cfg.entityExtraction.enabled) {
-          const entities = await entityExtraction.extract({
-            text: candidate.text,
-            runId,
-          });
-          if (entities.length > 0) {
-            entityAnnotatedCandidates += 1;
-            totalEntitiesAttached += entities.length;
-            metadata.entityUris = entities.map((entity) => entity.canonicalUri);
-            metadata.entities = entities;
+      await withStateLock(runtimeStatePaths.stateLockFile, async () => {
+        const dedupe = await readCaptureDedupeState(runtimeStatePaths);
+        const stats = await readStatsState(runtimeStatePaths);
+        const lifecycle = cfg.lifecycle.enabled
+          ? await readLifecycleState(runtimeStatePaths)
+          : null;
+        const now = Date.now();
+        const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+        for (const [key, ts] of Object.entries(dedupe.seen)) {
+          if (now - ts > thirtyDays) {
+            delete dedupe.seen[key];
           }
         }
 
-        mem0AddAttempts += 1;
-        const addResult = await mem0.addMemory({
-          text: candidate.text,
-          scope,
-          metadata,
-          runId,
-        });
-        if (addResult.id) {
-          mem0AddWithId += 1;
-        } else {
-          mem0AddWithoutId += 1;
-          log.warn("memory_braid.capture.persist", {
-            runId,
-            reason: "mem0_add_missing_id",
+        let persisted = 0;
+        let dedupeSkipped = 0;
+        let entityAnnotatedCandidates = 0;
+        let totalEntitiesAttached = 0;
+        let mem0AddAttempts = 0;
+        let mem0AddWithId = 0;
+        let mem0AddWithoutId = 0;
+        for (const candidate of candidates) {
+          const hash = sha256(normalizeForHash(candidate.text));
+          if (dedupe.seen[hash]) {
+            dedupeSkipped += 1;
+            continue;
+          }
+
+          const metadata: Record<string, unknown> = {
+            sourceType: "capture",
             workspaceHash: scope.workspaceHash,
             agentId: scope.agentId,
             sessionKey: scope.sessionKey,
-            contentHashPrefix: hash.slice(0, 12),
             category: candidate.category,
-          });
-        }
-        persisted += 1;
-      }
+            captureScore: candidate.score,
+            extractionSource: candidate.source,
+            contentHash: hash,
+            indexedAt: new Date(now).toISOString(),
+          };
 
-      await writeCaptureDedupeState(statePaths, dedupe);
-      log.debug("memory_braid.capture.persist", {
-        runId,
-        mode: cfg.capture.mode,
-        workspaceHash: scope.workspaceHash,
-        agentId: scope.agentId,
-        sessionKey: scope.sessionKey,
-        candidates: candidates.length,
-        dedupeSkipped,
-        persisted,
-        mem0AddAttempts,
-        mem0AddWithId,
-        mem0AddWithoutId,
-        entityExtractionEnabled: cfg.entityExtraction.enabled,
-        entityAnnotatedCandidates,
-        totalEntitiesAttached,
-      }, true);
+          if (cfg.entityExtraction.enabled) {
+            const entities = await entityExtraction.extract({
+              text: candidate.text,
+              runId,
+            });
+            if (entities.length > 0) {
+              entityAnnotatedCandidates += 1;
+              totalEntitiesAttached += entities.length;
+              metadata.entityUris = entities.map((entity) => entity.canonicalUri);
+              metadata.entities = entities;
+            }
+          }
+
+          mem0AddAttempts += 1;
+          const addResult = await mem0.addMemory({
+            text: candidate.text,
+            scope,
+            metadata,
+            runId,
+          });
+          if (addResult.id) {
+            dedupe.seen[hash] = now;
+            mem0AddWithId += 1;
+            persisted += 1;
+            if (lifecycle) {
+              const memoryId = addResult.id;
+              const existing = lifecycle.entries[memoryId];
+              lifecycle.entries[memoryId] = {
+                memoryId,
+                contentHash: hash,
+                workspaceHash: scope.workspaceHash,
+                agentId: scope.agentId,
+                sessionKey: scope.sessionKey,
+                category: candidate.category,
+                createdAt: existing?.createdAt ?? now,
+                lastCapturedAt: now,
+                lastRecalledAt: existing?.lastRecalledAt,
+                recallCount: existing?.recallCount ?? 0,
+                updatedAt: now,
+              };
+            }
+          } else {
+            mem0AddWithoutId += 1;
+            log.warn("memory_braid.capture.persist", {
+              runId,
+              reason: "mem0_add_missing_id",
+              workspaceHash: scope.workspaceHash,
+              agentId: scope.agentId,
+              sessionKey: scope.sessionKey,
+              contentHashPrefix: hash.slice(0, 12),
+              category: candidate.category,
+            });
+          }
+        }
+
+        stats.capture.runs += 1;
+        stats.capture.runsWithCandidates += 1;
+        stats.capture.candidates += candidates.length;
+        stats.capture.dedupeSkipped += dedupeSkipped;
+        stats.capture.persisted += persisted;
+        stats.capture.mem0AddAttempts += mem0AddAttempts;
+        stats.capture.mem0AddWithId += mem0AddWithId;
+        stats.capture.mem0AddWithoutId += mem0AddWithoutId;
+        stats.capture.entityAnnotatedCandidates += entityAnnotatedCandidates;
+        stats.capture.totalEntitiesAttached += totalEntitiesAttached;
+        stats.capture.lastRunAt = new Date(now).toISOString();
+
+        await writeCaptureDedupeState(runtimeStatePaths, dedupe);
+        if (lifecycle) {
+          await writeLifecycleState(runtimeStatePaths, lifecycle);
+        }
+        await writeStatsState(runtimeStatePaths, stats);
+        log.debug("memory_braid.capture.persist", {
+          runId,
+          mode: cfg.capture.mode,
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+          candidates: candidates.length,
+          dedupeSkipped,
+          persisted,
+          mem0AddAttempts,
+          mem0AddWithId,
+          mem0AddWithoutId,
+          entityExtractionEnabled: cfg.entityExtraction.enabled,
+          entityAnnotatedCandidates,
+          totalEntitiesAttached,
+        }, true);
+      });
     });
 
     api.registerService({
@@ -577,31 +1115,26 @@ const memoryBraidPlugin = {
         entityExtraction.setStateDir(ctx.stateDir);
         statePaths = createStatePaths(ctx.stateDir);
         await ensureStateDir(statePaths);
-        targets = await resolveTargets({
-          config: api.config as unknown as {
-            agents?: {
-              defaults?: { workspace?: string };
-              list?: Array<{ id?: string; workspace?: string; default?: boolean }>;
-            };
-          },
-          stateDir: ctx.stateDir,
-          fallbackWorkspaceDir: ctx.workspaceDir,
-        });
 
         const runId = log.newRunId();
         log.info("memory_braid.startup", {
           runId,
           stateDir: ctx.stateDir,
-          targets: targets.length,
         });
         log.info("memory_braid.config", {
           runId,
           mem0Mode: cfg.mem0.mode,
           captureEnabled: cfg.capture.enabled,
           captureMode: cfg.capture.mode,
+          captureIncludeAssistant: cfg.capture.includeAssistant,
           captureMaxItemsPerRun: cfg.capture.maxItemsPerRun,
           captureMlProvider: cfg.capture.ml.provider ?? "unset",
           captureMlModel: cfg.capture.ml.model ?? "unset",
+          timeDecayEnabled: cfg.timeDecay.enabled,
+          lifecycleEnabled: cfg.lifecycle.enabled,
+          lifecycleCaptureTtlDays: cfg.lifecycle.captureTtlDays,
+          lifecycleCleanupIntervalMinutes: cfg.lifecycle.cleanupIntervalMinutes,
+          lifecycleReinforceOnRecall: cfg.lifecycle.reinforceOnRecall,
           entityExtractionEnabled: cfg.entityExtraction.enabled,
           entityProvider: cfg.entityExtraction.provider,
           entityModel: cfg.entityExtraction.model,
@@ -613,39 +1146,20 @@ const memoryBraidPlugin = {
           debugSamplingRate: cfg.debug.logSamplingRate,
         });
 
-        // Keep startup work non-blocking, but serialize bootstrap and startup reconcile
-        // so they do not contend on the same state lock.
-        void (async () => {
-          await runBootstrapIfNeeded({
-            cfg,
-            mem0,
-            statePaths,
-            log,
-            targets,
+        void runLifecycleCleanupOnce({
+          cfg,
+          mem0,
+          log,
+          statePaths,
+          reason: "startup",
+          runId,
+        }).catch((err) => {
+          log.warn("memory_braid.lifecycle.cleanup", {
             runId,
-          }).catch((err) => {
-            log.warn("memory_braid.bootstrap.error", {
-              runId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-
-          await runReconcileOnce({
-            cfg,
-            mem0,
-            statePaths,
-            log,
-            targets,
             reason: "startup",
-            runId,
-          }).catch((err) => {
-            log.warn("memory_braid.reconcile.error", {
-              runId,
-              reason: "startup",
-              error: err instanceof Error ? err.message : String(err),
-            });
+            error: err instanceof Error ? err.message : String(err),
           });
-        })();
+        });
 
         if (cfg.entityExtraction.enabled && cfg.entityExtraction.startup.downloadOnStartup) {
           void entityExtraction
@@ -662,18 +1176,18 @@ const memoryBraidPlugin = {
             });
         }
 
-        if (cfg.reconcile.enabled) {
-          const intervalMs = cfg.reconcile.intervalMinutes * 60 * 1000;
-          serviceTimer = setInterval(() => {
-            void runReconcileOnce({
+        if (cfg.lifecycle.enabled) {
+          const intervalMs = cfg.lifecycle.cleanupIntervalMinutes * 60 * 1000;
+          lifecycleTimer = setInterval(() => {
+            void runLifecycleCleanupOnce({
               cfg,
               mem0,
-              statePaths: statePaths!,
               log,
-              targets,
+              statePaths: statePaths!,
               reason: "interval",
             }).catch((err) => {
-              log.warn("memory_braid.reconcile.error", {
+              log.warn("memory_braid.lifecycle.cleanup", {
+                reason: "interval",
                 error: err instanceof Error ? err.message : String(err),
               });
             });
@@ -681,9 +1195,9 @@ const memoryBraidPlugin = {
         }
       },
       stop: async () => {
-        if (serviceTimer) {
-          clearInterval(serviceTimer);
-          serviceTimer = null;
+        if (lifecycleTimer) {
+          clearInterval(lifecycleTimer);
+          lifecycleTimer = null;
         }
       },
     });

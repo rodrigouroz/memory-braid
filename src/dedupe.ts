@@ -71,14 +71,14 @@ export async function stagedDedupe(
       }
 
       if (!options.semanticCompare) {
-        duplicate = true;
-        break;
+        // Keep candidate when semantic comparison is unavailable.
+        continue;
       }
 
       const semantic = await options.semanticCompare(candidate, chosen);
       if (typeof semantic !== "number") {
-        duplicate = true;
-        break;
+        // Keep candidate when semantic score is unavailable.
+        continue;
       }
       if (semantic >= options.semanticMinScore) {
         duplicate = true;

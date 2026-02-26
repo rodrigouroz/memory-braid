@@ -392,13 +392,21 @@ export async function extractCandidates(params: {
   runId?: string;
 }): Promise<ExtractedCandidate[]> {
   const normalized = normalizeMessages(params.messages);
-  const heuristic = pickHeuristicCandidates(normalized, params.cfg.capture.maxItemsPerRun);
+  const captureFromAssistant = params.cfg.capture.includeAssistant;
+  const candidatesInput = normalized.filter((message) =>
+    captureFromAssistant
+      ? message.role === "user" || message.role === "assistant"
+      : message.role === "user",
+  );
+  const heuristic = pickHeuristicCandidates(candidatesInput, params.cfg.capture.maxItemsPerRun);
 
   params.log.debug("memory_braid.capture.extract", {
     runId: params.runId,
     mode: params.cfg.capture.mode,
+    includeAssistant: captureFromAssistant,
     maxItemsPerRun: params.cfg.capture.maxItemsPerRun,
     totalMessages: normalized.length,
+    eligibleMessages: candidatesInput.length,
     heuristicCandidates: heuristic.length,
   });
 
@@ -452,7 +460,7 @@ export async function extractCandidates(params: {
       model: params.cfg.capture.ml.model,
       timeoutMs: params.cfg.capture.ml.timeoutMs,
       maxItems: params.cfg.capture.maxItemsPerRun,
-      messages: normalized,
+      messages: candidatesInput,
     });
     const mlExtracted = applyMlExtractionResult(mlExtractedRaw, params.cfg.capture.maxItemsPerRun);
     params.log.debug("memory_braid.capture.ml", {

@@ -43,4 +43,20 @@ describe("stagedDedupe", () => {
     expect(deduped).toHaveLength(2);
     expect(deduped.map((item) => item.snippet)).toContain("Deploy every Friday");
   });
+
+  it("keeps candidates when semantic score is unavailable", async () => {
+    const items: MemoryBraidResult[] = [
+      { source: "local", snippet: "User likes concise answers", score: 0.9 },
+      { source: "mem0", snippet: "The user prefers concise replies", score: 0.88 },
+    ];
+
+    const deduped = await stagedDedupe(items, {
+      lexicalMinJaccard: 0.2,
+      semanticEnabled: true,
+      semanticMinScore: 0.9,
+      semanticCompare: async () => undefined,
+    });
+
+    expect(deduped).toHaveLength(2);
+  });
 });

@@ -1,27 +1,43 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { BootstrapState, CaptureDedupeState, ReconcileState } from "./types.js";
-
-const DEFAULT_BOOTSTRAP: BootstrapState = {
-  version: 1,
-  completed: false,
-};
-
-const DEFAULT_RECONCILE: ReconcileState = {
-  version: 1,
-  entries: {},
-};
+import type {
+  CaptureDedupeState,
+  LifecycleState,
+  PluginStatsState,
+} from "./types.js";
 
 const DEFAULT_CAPTURE_DEDUPE: CaptureDedupeState = {
   version: 1,
   seen: {},
 };
 
+const DEFAULT_LIFECYCLE: LifecycleState = {
+  version: 1,
+  entries: {},
+};
+
+const DEFAULT_STATS: PluginStatsState = {
+  version: 1,
+  capture: {
+    runs: 0,
+    runsWithCandidates: 0,
+    runsNoCandidates: 0,
+    candidates: 0,
+    dedupeSkipped: 0,
+    persisted: 0,
+    mem0AddAttempts: 0,
+    mem0AddWithId: 0,
+    mem0AddWithoutId: 0,
+    entityAnnotatedCandidates: 0,
+    totalEntitiesAttached: 0,
+  },
+};
+
 export type StatePaths = {
   rootDir: string;
-  bootstrapFile: string;
-  reconcileFile: string;
   captureDedupeFile: string;
+  lifecycleFile: string;
+  statsFile: string;
   stateLockFile: string;
 };
 
@@ -29,9 +45,9 @@ export function createStatePaths(stateDir: string): StatePaths {
   const rootDir = path.join(stateDir, "memory-braid");
   return {
     rootDir,
-    bootstrapFile: path.join(rootDir, "bootstrap-checkpoint.v1.json"),
-    reconcileFile: path.join(rootDir, "reconcile-state.v1.json"),
     captureDedupeFile: path.join(rootDir, "capture-dedupe.v1.json"),
+    lifecycleFile: path.join(rootDir, "lifecycle.v1.json"),
+    statsFile: path.join(rootDir, "stats.v1.json"),
     stateLockFile: path.join(rootDir, "state.v1.lock"),
   };
 }
@@ -57,28 +73,6 @@ async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
   await fs.rename(tmpPath, filePath);
 }
 
-export async function readBootstrapState(paths: StatePaths): Promise<BootstrapState> {
-  const value = await readJsonFile(paths.bootstrapFile, DEFAULT_BOOTSTRAP);
-  return { ...DEFAULT_BOOTSTRAP, ...value };
-}
-
-export async function writeBootstrapState(paths: StatePaths, state: BootstrapState): Promise<void> {
-  await writeJsonFile(paths.bootstrapFile, state);
-}
-
-export async function readReconcileState(paths: StatePaths): Promise<ReconcileState> {
-  const value = await readJsonFile(paths.reconcileFile, DEFAULT_RECONCILE);
-  return {
-    version: 1,
-    entries: value.entries ?? {},
-    lastRunAt: value.lastRunAt,
-  };
-}
-
-export async function writeReconcileState(paths: StatePaths, state: ReconcileState): Promise<void> {
-  await writeJsonFile(paths.reconcileFile, state);
-}
-
 export async function readCaptureDedupeState(paths: StatePaths): Promise<CaptureDedupeState> {
   const value = await readJsonFile(paths.captureDedupeFile, DEFAULT_CAPTURE_DEDUPE);
   return {
@@ -92,6 +86,39 @@ export async function writeCaptureDedupeState(
   state: CaptureDedupeState,
 ): Promise<void> {
   await writeJsonFile(paths.captureDedupeFile, state);
+}
+
+export async function readLifecycleState(paths: StatePaths): Promise<LifecycleState> {
+  const value = await readJsonFile(paths.lifecycleFile, DEFAULT_LIFECYCLE);
+  return {
+    version: 1,
+    entries: value.entries ?? {},
+    lastCleanupAt: value.lastCleanupAt,
+    lastCleanupReason: value.lastCleanupReason,
+    lastCleanupScanned: value.lastCleanupScanned,
+    lastCleanupExpired: value.lastCleanupExpired,
+    lastCleanupDeleted: value.lastCleanupDeleted,
+    lastCleanupFailed: value.lastCleanupFailed,
+  };
+}
+
+export async function writeLifecycleState(paths: StatePaths, state: LifecycleState): Promise<void> {
+  await writeJsonFile(paths.lifecycleFile, state);
+}
+
+export async function readStatsState(paths: StatePaths): Promise<PluginStatsState> {
+  const value = await readJsonFile(paths.statsFile, DEFAULT_STATS);
+  return {
+    version: 1,
+    capture: {
+      ...DEFAULT_STATS.capture,
+      ...(value.capture ?? {}),
+    },
+  };
+}
+
+export async function writeStatsState(paths: StatePaths, state: PluginStatsState): Promise<void> {
+  await writeJsonFile(paths.statsFile, state);
 }
 
 export async function withStateLock<T>(
