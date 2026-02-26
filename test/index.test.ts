@@ -205,6 +205,116 @@ describe("memory-braid plugin", () => {
     expect(snippets[0]).toContain("Recent memory");
   });
 
+  it("filters irrelevant generic summaries from injected memories", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        source: "mem0",
+        snippet: "The user asked about reembolso in drapp and Seer ecosystem updates.",
+        score: 0.98,
+        metadata: { category: "other", indexedAt: "2026-02-25T12:00:00.000Z" },
+      },
+      {
+        source: "mem0",
+        snippet:
+          "Implement memory-braid relevance gating so only overlapping memories are injected.",
+        score: 0.72,
+        metadata: { category: "decision", sessionKey: "s1", indexedAt: "2026-02-25T12:00:00.000Z" },
+      },
+      {
+        source: "mem0",
+        snippet: "Apply mem0 relevance ranking with session-aware boosts and category-age penalties.",
+        score: 0.7,
+        metadata: { category: "decision", sessionKey: "s1", indexedAt: "2026-02-25T12:00:00.000Z" },
+      },
+    ]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    expect(beforeAgentStart).toBeTypeOf("function");
+
+    const result = await beforeAgentStart!(
+      {
+        prompt: "Implement memory-braid relevance gating and mem0 relevance ranking fixes",
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(result && "prependContext" in result ? result.prependContext : "").toContain(
+      "relevance gating",
+    );
+    expect(result && "prependContext" in result ? result.prependContext : "").toContain(
+      "session-aware boosts",
+    );
+    expect(result && "prependContext" in result ? result.prependContext : "").not.toContain(
+      "reembolso",
+    );
+  });
+
+  it("downranks stale low-overlap task memories before merge", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        source: "mem0",
+        snippet: "Follow up on the drapp reembolso ticket from last year.",
+        score: 0.95,
+        metadata: { category: "task", indexedAt: "2025-01-01T00:00:00.000Z" },
+      },
+      {
+        source: "mem0",
+        snippet: "User prefers afternoon standups for planning.",
+        score: 0.72,
+        metadata: { category: "preference", indexedAt: "2026-02-20T00:00:00.000Z", sessionKey: "s1" },
+      },
+    ]);
+    const { api, tools } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const factory = tools[0]?.factory as
+      | ((ctx: unknown) => Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }>)
+      | undefined;
+    expect(factory).toBeTypeOf("function");
+    const boundTools = factory!({
+      config: api.config,
+      workspaceDir: "/tmp",
+      agentId: "main",
+      sessionKey: "s1",
+    });
+    const searchTool = boundTools.find((tool) => tool.name === "memory_search");
+    expect(searchTool).toBeTruthy();
+
+    const output = await searchTool!.execute("call-1", {
+      query: "standups preference planning",
+    });
+    const details = (output as { details?: { results?: Array<{ snippet?: string }> } }).details;
+    const snippets = (details?.results ?? []).map((entry) => entry.snippet ?? "");
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(snippets[0]).toContain("afternoon standups");
+  });
+
   it("reports capture counters via /memorybraid stats", async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
     const stateDir = path.join(tempDir, "state");

@@ -105,6 +105,315 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+const OVERLAP_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "how",
+  "i",
+  "in",
+  "is",
+  "it",
+  "my",
+  "of",
+  "on",
+  "or",
+  "our",
+  "that",
+  "the",
+  "this",
+  "to",
+  "we",
+  "with",
+  "you",
+  "your",
+  "de",
+  "del",
+  "el",
+  "en",
+  "es",
+  "la",
+  "las",
+  "los",
+  "mi",
+  "mis",
+  "para",
+  "por",
+  "que",
+  "se",
+  "su",
+  "sus",
+  "un",
+  "una",
+  "y",
+]);
+
+function normalizeToken(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/\p{M}+/gu, "");
+}
+
+function tokenizeForOverlap(text: string): Set<string> {
+  const tokens = text.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const out = new Set<string>();
+  for (const token of tokens) {
+    const normalized = normalizeToken(token);
+    if (normalized.length < 3 || OVERLAP_STOPWORDS.has(normalized)) {
+      continue;
+    }
+    out.add(normalized);
+  }
+  return out;
+}
+
+function lexicalOverlap(queryTokens: Set<string>, text: string): { shared: number; ratio: number } {
+  if (queryTokens.size === 0) {
+    return { shared: 0, ratio: 0 };
+  }
+  const textTokens = tokenizeForOverlap(text);
+  let shared = 0;
+  for (const token of queryTokens) {
+    if (textTokens.has(token)) {
+      shared += 1;
+    }
+  }
+  return {
+    shared,
+    ratio: shared / queryTokens.size,
+  };
+}
+
+function normalizeCategory(raw: unknown): "preference" | "decision" | "fact" | "task" | "other" | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === "preference" ||
+    normalized === "decision" ||
+    normalized === "fact" ||
+    normalized === "task" ||
+    normalized === "other"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function normalizeSessionKey(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  return trimmed || undefined;
+}
+
+function isGenericUserSummary(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return (
+    /^(the user|user|usuario)\b/.test(normalized) ||
+    /\b(user|usuario)\s+(asked|wants|needs|prefers|likes|said)\b/.test(normalized)
+  );
+}
+
+function applyMem0QualityAdjustments(params: {
+  results: MemoryBraidResult[];
+  query: string;
+  scope: ScopeKey;
+  nowMs: number;
+}): {
+  results: MemoryBraidResult[];
+  adjusted: number;
+  overlapBoosted: number;
+  overlapPenalized: number;
+  categoryPenalized: number;
+  sessionBoosted: number;
+  sessionPenalized: number;
+  genericPenalized: number;
+} {
+  if (params.results.length === 0) {
+    return {
+      results: params.results,
+      adjusted: 0,
+      overlapBoosted: 0,
+      overlapPenalized: 0,
+      categoryPenalized: 0,
+      sessionBoosted: 0,
+      sessionPenalized: 0,
+      genericPenalized: 0,
+    };
+  }
+
+  const queryTokens = tokenizeForOverlap(params.query);
+  let adjusted = 0;
+  let overlapBoosted = 0;
+  let overlapPenalized = 0;
+  let categoryPenalized = 0;
+  let sessionBoosted = 0;
+  let sessionPenalized = 0;
+  let genericPenalized = 0;
+
+  const next = params.results.map((result, index) => {
+    let multiplier = 1;
+    const metadata = asRecord(result.metadata);
+    const overlap = lexicalOverlap(queryTokens, result.snippet);
+    const category = normalizeCategory(metadata.category);
+    const isGeneric = isGenericUserSummary(result.snippet);
+    const ts = resolveTimestampMs(result);
+    const ageDays = ts ? Math.max(0, (params.nowMs - ts) / (24 * 60 * 60 * 1000)) : undefined;
+
+    if ((category === "task" || category === "other") && typeof ageDays === "number") {
+      if (ageDays >= 30) {
+        multiplier *= 0.5;
+        categoryPenalized += 1;
+      } else if (ageDays >= 7) {
+        multiplier *= category === "task" ? 0.65 : 0.72;
+        categoryPenalized += 1;
+      }
+    } else if (typeof ageDays === "number" && ageDays >= 180) {
+      multiplier *= 0.9;
+      categoryPenalized += 1;
+    }
+
+    if (queryTokens.size > 0) {
+      if (overlap.shared >= 2 || overlap.ratio >= 0.45) {
+        multiplier *= 1.25;
+        overlapBoosted += 1;
+      } else if (overlap.shared === 1 || overlap.ratio >= 0.2) {
+        multiplier *= 1.1;
+        overlapBoosted += 1;
+      } else {
+        multiplier *= 0.62;
+        overlapPenalized += 1;
+      }
+    }
+
+    const metadataSession =
+      normalizeSessionKey(metadata.sessionKey) ??
+      normalizeSessionKey(metadata.runId) ??
+      normalizeSessionKey(metadata.run_id);
+    if (params.scope.sessionKey && metadataSession) {
+      if (metadataSession === params.scope.sessionKey) {
+        multiplier *= 1.1;
+        sessionBoosted += 1;
+      } else {
+        multiplier *= 0.82;
+        sessionPenalized += 1;
+      }
+    }
+
+    if (isGeneric && overlap.ratio < 0.2 && overlap.shared < 2) {
+      multiplier *= 0.6;
+      genericPenalized += 1;
+    }
+
+    const normalizedMultiplier = Math.min(2.5, Math.max(0.1, multiplier));
+    const nextScore = result.score * normalizedMultiplier;
+    if (nextScore !== result.score) {
+      adjusted += 1;
+    }
+
+    return {
+      index,
+      result: {
+        ...result,
+        score: nextScore,
+      },
+    };
+  });
+
+  next.sort((left, right) => {
+    const scoreDelta = right.result.score - left.result.score;
+    if (scoreDelta !== 0) {
+      return scoreDelta;
+    }
+    return left.index - right.index;
+  });
+
+  return {
+    results: next.map((entry) => entry.result),
+    adjusted,
+    overlapBoosted,
+    overlapPenalized,
+    categoryPenalized,
+    sessionBoosted,
+    sessionPenalized,
+    genericPenalized,
+  };
+}
+
+function selectMemoriesForInjection(params: {
+  query: string;
+  results: MemoryBraidResult[];
+  limit: number;
+}): {
+  injected: MemoryBraidResult[];
+  queryTokens: number;
+  filteredOut: number;
+  genericRejected: number;
+} {
+  const limit = Math.max(0, Math.floor(params.limit));
+  if (limit === 0 || params.results.length === 0) {
+    return {
+      injected: [],
+      queryTokens: 0,
+      filteredOut: 0,
+      genericRejected: 0,
+    };
+  }
+
+  const queryTokens = tokenizeForOverlap(params.query);
+  if (queryTokens.size === 0) {
+    return {
+      injected: params.results.slice(0, limit),
+      queryTokens: 0,
+      filteredOut: Math.max(0, params.results.length - Math.min(limit, params.results.length)),
+      genericRejected: 0,
+    };
+  }
+
+  const injected: MemoryBraidResult[] = [];
+  let filteredOut = 0;
+  let genericRejected = 0;
+
+  for (const result of params.results) {
+    if (injected.length >= limit) {
+      break;
+    }
+    const overlap = lexicalOverlap(queryTokens, result.snippet);
+    const generic = isGenericUserSummary(result.snippet);
+    const strongThreshold = result.source === "local" ? 0.26 : 0.34;
+    const weakThreshold = result.source === "local" ? 0.12 : 0.18;
+    const strongMatch = overlap.shared >= 2 || overlap.ratio >= strongThreshold;
+    const weakMatch = overlap.shared >= 1 && overlap.ratio >= weakThreshold;
+    const keep = generic ? overlap.shared >= 2 || overlap.ratio >= 0.5 : strongMatch || weakMatch;
+    if (keep) {
+      injected.push(result);
+      continue;
+    }
+    filteredOut += 1;
+    if (generic) {
+      genericRejected += 1;
+    }
+  }
+
+  return {
+    injected,
+    queryTokens: queryTokens.size,
+    filteredOut,
+    genericRejected,
+  };
+}
+
 function resolveCoreTemporalDecay(params: {
   config?: unknown;
   agentId?: string;
@@ -528,6 +837,27 @@ async function runHybridRecall(params: {
       });
     }
   }
+  const qualityAdjusted = applyMem0QualityAdjustments({
+    results: mem0ForMerge,
+    query: params.query,
+    scope,
+    nowMs: Date.now(),
+  });
+  mem0ForMerge = qualityAdjusted.results;
+  params.log.debug("memory_braid.search.mem0_quality", {
+    runId: params.runId,
+    agentId: scope.agentId,
+    sessionKey: scope.sessionKey,
+    workspaceHash: scope.workspaceHash,
+    inputCount: mem0Search.length,
+    adjusted: qualityAdjusted.adjusted,
+    overlapBoosted: qualityAdjusted.overlapBoosted,
+    overlapPenalized: qualityAdjusted.overlapPenalized,
+    categoryPenalized: qualityAdjusted.categoryPenalized,
+    sessionBoosted: qualityAdjusted.sessionBoosted,
+    sessionPenalized: qualityAdjusted.sessionPenalized,
+    genericPenalized: qualityAdjusted.genericPenalized,
+  });
   params.log.debug("memory_braid.search.mem0", {
     runId: params.runId,
     agentId: scope.agentId,
@@ -913,19 +1243,38 @@ const memoryBraidPlugin = {
         runId,
       });
 
-      const injected = recall.merged.slice(0, cfg.recall.injectTopK);
-      if (injected.length === 0) {
+      const selected = selectMemoriesForInjection({
+        query: event.prompt,
+        results: recall.merged,
+        limit: cfg.recall.injectTopK,
+      });
+      if (selected.injected.length === 0) {
+        const scope = resolveScopeFromHookContext(ctx);
+        log.debug("memory_braid.search.inject", {
+          runId,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+          workspaceHash: scope.workspaceHash,
+          count: 0,
+          queryTokens: selected.queryTokens,
+          filteredOut: selected.filteredOut,
+          genericRejected: selected.genericRejected,
+          reason: "no_relevant_memories",
+        });
         return;
       }
 
-      const prependContext = formatRelevantMemories(injected, cfg.debug.maxSnippetChars);
+      const prependContext = formatRelevantMemories(selected.injected, cfg.debug.maxSnippetChars);
       const scope = resolveScopeFromHookContext(ctx);
       log.debug("memory_braid.search.inject", {
         runId,
         agentId: scope.agentId,
         sessionKey: scope.sessionKey,
         workspaceHash: scope.workspaceHash,
-        count: injected.length,
+        count: selected.injected.length,
+        queryTokens: selected.queryTokens,
+        filteredOut: selected.filteredOut,
+        genericRejected: selected.genericRejected,
         injectedTextPreview: prependContext,
       });
 
