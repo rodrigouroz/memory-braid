@@ -468,6 +468,17 @@ export async function extractCandidates(params: {
 
   try {
     if (params.cfg.capture.mode === "hybrid") {
+      if (heuristic.length === 0) {
+        params.log.debug("memory_braid.capture.ml", {
+          runId: params.runId,
+          mode: params.cfg.capture.mode,
+          provider: params.cfg.capture.ml.provider,
+          model: params.cfg.capture.ml.model,
+          decision: "skip_ml_enrichment_no_heuristic_candidates",
+        });
+        return heuristic;
+      }
+
       const ml = await callMlEnrichment({
         provider: params.cfg.capture.ml.provider,
         model: params.cfg.capture.ml.model,

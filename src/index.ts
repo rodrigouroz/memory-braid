@@ -1345,6 +1345,112 @@ const memoryBraidPlugin = {
         return;
       }
 
+      const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+      const candidateEntries = candidates.map((candidate) => ({
+        candidate,
+        hash: sha256(normalizeForHash(candidate.text)),
+      }));
+
+      const prepared = await withStateLock(runtimeStatePaths.stateLockFile, async () => {
+        const dedupe = await readCaptureDedupeState(runtimeStatePaths);
+        const now = Date.now();
+
+        let pruned = 0;
+        for (const [key, ts] of Object.entries(dedupe.seen)) {
+          if (now - ts > thirtyDays) {
+            delete dedupe.seen[key];
+            pruned += 1;
+          }
+        }
+
+        let dedupeSkipped = 0;
+        const pending: typeof candidateEntries = [];
+        const seenInBatch = new Set<string>();
+        for (const entry of candidateEntries) {
+          if (dedupe.seen[entry.hash] || seenInBatch.has(entry.hash)) {
+            dedupeSkipped += 1;
+            continue;
+          }
+          seenInBatch.add(entry.hash);
+          pending.push(entry);
+        }
+
+        if (pruned > 0) {
+          await writeCaptureDedupeState(runtimeStatePaths, dedupe);
+        }
+
+        return {
+          dedupeSkipped,
+          pending,
+        };
+      });
+
+      let entityAnnotatedCandidates = 0;
+      let totalEntitiesAttached = 0;
+      let mem0AddAttempts = 0;
+      let mem0AddWithId = 0;
+      let mem0AddWithoutId = 0;
+      const successfulAdds: Array<{
+        memoryId: string;
+        hash: string;
+        category: (typeof candidates)[number]["category"];
+      }> = [];
+
+      for (const entry of prepared.pending) {
+        const { candidate, hash } = entry;
+        const metadata: Record<string, unknown> = {
+          sourceType: "capture",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+          category: candidate.category,
+          captureScore: candidate.score,
+          extractionSource: candidate.source,
+          contentHash: hash,
+          indexedAt: new Date().toISOString(),
+        };
+
+        if (cfg.entityExtraction.enabled) {
+          const entities = await entityExtraction.extract({
+            text: candidate.text,
+            runId,
+          });
+          if (entities.length > 0) {
+            entityAnnotatedCandidates += 1;
+            totalEntitiesAttached += entities.length;
+            metadata.entityUris = entities.map((entity) => entity.canonicalUri);
+            metadata.entities = entities;
+          }
+        }
+
+        mem0AddAttempts += 1;
+        const addResult = await mem0.addMemory({
+          text: candidate.text,
+          scope,
+          metadata,
+          runId,
+        });
+        if (addResult.id) {
+          mem0AddWithId += 1;
+          successfulAdds.push({
+            memoryId: addResult.id,
+            hash,
+            category: candidate.category,
+          });
+        } else {
+          mem0AddWithoutId += 1;
+          log.warn("memory_braid.capture.persist", {
+            runId,
+            reason: "mem0_add_missing_id",
+            workspaceHash: scope.workspaceHash,
+            agentId: scope.agentId,
+            sessionKey: scope.sessionKey,
+            contentHashPrefix: hash.slice(0, 12),
+            category: candidate.category,
+          });
+        }
+      }
+
       await withStateLock(runtimeStatePaths.stateLockFile, async () => {
         const dedupe = await readCaptureDedupeState(runtimeStatePaths);
         const stats = await readStatsState(runtimeStatePaths);
@@ -1352,7 +1458,7 @@ const memoryBraidPlugin = {
           ? await readLifecycleState(runtimeStatePaths)
           : null;
         const now = Date.now();
-        const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+
         for (const [key, ts] of Object.entries(dedupe.seen)) {
           if (now - ts > thirtyDays) {
             delete dedupe.seen[key];
@@ -1360,90 +1466,32 @@ const memoryBraidPlugin = {
         }
 
         let persisted = 0;
-        let dedupeSkipped = 0;
-        let entityAnnotatedCandidates = 0;
-        let totalEntitiesAttached = 0;
-        let mem0AddAttempts = 0;
-        let mem0AddWithId = 0;
-        let mem0AddWithoutId = 0;
-        for (const candidate of candidates) {
-          const hash = sha256(normalizeForHash(candidate.text));
-          if (dedupe.seen[hash]) {
-            dedupeSkipped += 1;
-            continue;
-          }
+        for (const entry of successfulAdds) {
+          dedupe.seen[entry.hash] = now;
+          persisted += 1;
 
-          const metadata: Record<string, unknown> = {
-            sourceType: "capture",
-            workspaceHash: scope.workspaceHash,
-            agentId: scope.agentId,
-            sessionKey: scope.sessionKey,
-            category: candidate.category,
-            captureScore: candidate.score,
-            extractionSource: candidate.source,
-            contentHash: hash,
-            indexedAt: new Date(now).toISOString(),
-          };
-
-          if (cfg.entityExtraction.enabled) {
-            const entities = await entityExtraction.extract({
-              text: candidate.text,
-              runId,
-            });
-            if (entities.length > 0) {
-              entityAnnotatedCandidates += 1;
-              totalEntitiesAttached += entities.length;
-              metadata.entityUris = entities.map((entity) => entity.canonicalUri);
-              metadata.entities = entities;
-            }
-          }
-
-          mem0AddAttempts += 1;
-          const addResult = await mem0.addMemory({
-            text: candidate.text,
-            scope,
-            metadata,
-            runId,
-          });
-          if (addResult.id) {
-            dedupe.seen[hash] = now;
-            mem0AddWithId += 1;
-            persisted += 1;
-            if (lifecycle) {
-              const memoryId = addResult.id;
-              const existing = lifecycle.entries[memoryId];
-              lifecycle.entries[memoryId] = {
-                memoryId,
-                contentHash: hash,
-                workspaceHash: scope.workspaceHash,
-                agentId: scope.agentId,
-                sessionKey: scope.sessionKey,
-                category: candidate.category,
-                createdAt: existing?.createdAt ?? now,
-                lastCapturedAt: now,
-                lastRecalledAt: existing?.lastRecalledAt,
-                recallCount: existing?.recallCount ?? 0,
-                updatedAt: now,
-              };
-            }
-          } else {
-            mem0AddWithoutId += 1;
-            log.warn("memory_braid.capture.persist", {
-              runId,
-              reason: "mem0_add_missing_id",
+          if (lifecycle) {
+            const existing = lifecycle.entries[entry.memoryId];
+            lifecycle.entries[entry.memoryId] = {
+              memoryId: entry.memoryId,
+              contentHash: entry.hash,
               workspaceHash: scope.workspaceHash,
               agentId: scope.agentId,
               sessionKey: scope.sessionKey,
-              contentHashPrefix: hash.slice(0, 12),
-              category: candidate.category,
-            });
+              category: entry.category,
+              createdAt: existing?.createdAt ?? now,
+              lastCapturedAt: now,
+              lastRecalledAt: existing?.lastRecalledAt,
+              recallCount: existing?.recallCount ?? 0,
+              updatedAt: now,
+            };
           }
         }
 
         stats.capture.runs += 1;
         stats.capture.runsWithCandidates += 1;
         stats.capture.candidates += candidates.length;
-        stats.capture.dedupeSkipped += dedupeSkipped;
+        stats.capture.dedupeSkipped += prepared.dedupeSkipped;
         stats.capture.persisted += persisted;
         stats.capture.mem0AddAttempts += mem0AddAttempts;
         stats.capture.mem0AddWithId += mem0AddWithId;
@@ -1464,7 +1512,8 @@ const memoryBraidPlugin = {
           agentId: scope.agentId,
           sessionKey: scope.sessionKey,
           candidates: candidates.length,
-          dedupeSkipped,
+          pending: prepared.pending.length,
+          dedupeSkipped: prepared.dedupeSkipped,
           persisted,
           mem0AddAttempts,
           mem0AddWithId,

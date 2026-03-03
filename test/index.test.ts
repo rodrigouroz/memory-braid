@@ -9,6 +9,7 @@ import {
   readCaptureDedupeState,
   readLifecycleState,
   readStatsState,
+  withStateLock,
   writeLifecycleState,
 } from "../src/state.js";
 
@@ -138,6 +139,61 @@ describe("memory-braid plugin", () => {
     expect(addSpy).toHaveBeenCalledTimes(1);
     const dedupe = await readCaptureDedupeState(createStatePaths(stateDir));
     expect(Object.keys(dedupe.seen)).toHaveLength(0);
+  });
+
+  it("does not hold the state lock while mem0 add is in flight", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    let releaseAdd: (() => void) | undefined;
+    let addStarted: (() => void) | undefined;
+    const addInFlight = new Promise<void>((resolve) => {
+      releaseAdd = resolve;
+    });
+    const addStartedPromise = new Promise<void>((resolve) => {
+      addStarted = resolve;
+    });
+    vi.spyOn(Mem0Adapter.prototype, "addMemory").mockImplementation(async () => {
+      addStarted?.();
+      await addInFlight;
+      return { id: "m-1" };
+    });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+    expect(agentEndHook).toBeTypeOf("function");
+
+    const runPromise = agentEndHook!(
+      {
+        success: true,
+        messages: [
+          {
+            role: "user",
+            content: "Remember that my timezone is PST and I prefer afternoon standups.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    await addStartedPromise;
+    const paths = createStatePaths(stateDir);
+    await expect(
+      withStateLock(
+        paths.stateLockFile,
+        async () => undefined,
+        { retries: 0 },
+      ),
+    ).resolves.toBeUndefined();
+
+    releaseAdd?.();
+    await runPromise;
   });
 
   it("applies memory-core temporal decay config to mem0 ranking when enabled", async () => {

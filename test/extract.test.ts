@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/config.js";
 import { extractCandidates } from "../src/extract.js";
 import { MemoryBraidLogger } from "../src/logger.js";
@@ -75,5 +75,34 @@ describe("extractCandidates role filtering", () => {
 
     expect(candidates.some((entry) => entry.text.includes("n8n/rss"))).toBe(false);
     expect(candidates.some((entry) => entry.text.includes("prefer black coffee"))).toBe(true);
+  });
+
+  it("skips hybrid ML enrichment when no heuristic candidates are found", async () => {
+    const cfg = parseConfig({
+      capture: {
+        mode: "hybrid",
+        ml: {
+          provider: "openai",
+          model: "gpt-4o-mini",
+        },
+      },
+    });
+    const log = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const candidates = await extractCandidates({
+      messages: [
+        {
+          role: "user",
+          content: "short note",
+        },
+      ],
+      cfg,
+      log,
+    });
+
+    expect(candidates).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

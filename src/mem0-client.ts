@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { normalizeForHash } from "./chunking.js";
+import { normalizeForHash, sha256 } from "./chunking.js";
 import type { MemoryBraidConfig } from "./config.js";
 import { MemoryBraidLogger } from "./logger.js";
 import type { MemoryBraidResult, ScopeKey } from "./types.js";
@@ -403,6 +403,9 @@ type Mem0AdapterOptions = {
   stateDir?: string;
 };
 
+const SEMANTIC_SEARCH_CACHE_TTL_MS = 30_000;
+const SEMANTIC_SEARCH_CACHE_MAX_ENTRIES = 256;
+
 export class Mem0Adapter {
   private cloudClient: CloudClientLike | null = null;
   private ossClient: OssClientLike | null = null;
@@ -410,6 +413,13 @@ export class Mem0Adapter {
   private readonly log: MemoryBraidLogger;
   private readonly pluginDir?: string;
   private stateDir?: string;
+  private readonly semanticSearchCache = new Map<
+    string,
+    {
+      expiresAt: number;
+      results: MemoryBraidResult[];
+    }
+  >();
 
   constructor(cfg: MemoryBraidConfig, log: MemoryBraidLogger, options?: Mem0AdapterOptions) {
     this.cfg = cfg;
@@ -425,6 +435,7 @@ export class Mem0Adapter {
     }
     this.stateDir = next;
     this.ossClient = null;
+    this.semanticSearchCache.clear();
   }
 
   private async ensureCloudClient(): Promise<CloudClientLike | null> {
@@ -844,17 +855,59 @@ export class Mem0Adapter {
     runId?: string;
   }): Promise<number | undefined> {
     const rightHash = normalizeForHash(params.rightText);
-    const results = await this.searchMemories({
-      query: params.leftText,
-      maxResults: 5,
-      scope: params.scope,
-      runId: params.runId,
-    });
+    if (!rightHash) {
+      return undefined;
+    }
+
+    const leftHash = normalizeForHash(params.leftText);
+    if (!leftHash) {
+      return undefined;
+    }
+
+    const now = Date.now();
+    this.pruneSemanticSearchCache(now);
+    const scopeSession = params.scope.sessionKey ?? "";
+    const cacheKey = `${params.scope.workspaceHash}|${params.scope.agentId}|${scopeSession}|${sha256(leftHash)}`;
+    const cached = this.semanticSearchCache.get(cacheKey);
+    const results =
+      cached && cached.expiresAt > now
+        ? cached.results
+        : await this.searchMemories({
+            query: params.leftText,
+            maxResults: 5,
+            scope: params.scope,
+            runId: params.runId,
+          });
+
+    if (!cached || cached.expiresAt <= now) {
+      this.semanticSearchCache.set(cacheKey, {
+        expiresAt: now + SEMANTIC_SEARCH_CACHE_TTL_MS,
+        results,
+      });
+      this.pruneSemanticSearchCache(now);
+    }
+
     for (const result of results) {
       if (normalizeForHash(result.snippet) === rightHash) {
         return result.score;
       }
     }
     return undefined;
+  }
+
+  private pruneSemanticSearchCache(now = Date.now()): void {
+    for (const [key, entry] of this.semanticSearchCache.entries()) {
+      if (entry.expiresAt <= now) {
+        this.semanticSearchCache.delete(key);
+      }
+    }
+
+    while (this.semanticSearchCache.size > SEMANTIC_SEARCH_CACHE_MAX_ENTRIES) {
+      const oldest = this.semanticSearchCache.keys().next().value as string | undefined;
+      if (!oldest) {
+        break;
+      }
+      this.semanticSearchCache.delete(oldest);
+    }
   }
 }

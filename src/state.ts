@@ -77,7 +77,7 @@ export async function readCaptureDedupeState(paths: StatePaths): Promise<Capture
   const value = await readJsonFile(paths.captureDedupeFile, DEFAULT_CAPTURE_DEDUPE);
   return {
     version: 1,
-    seen: value.seen ?? {},
+    seen: { ...(value.seen ?? {}) },
   };
 }
 
@@ -92,7 +92,7 @@ export async function readLifecycleState(paths: StatePaths): Promise<LifecycleSt
   const value = await readJsonFile(paths.lifecycleFile, DEFAULT_LIFECYCLE);
   return {
     version: 1,
-    entries: value.entries ?? {},
+    entries: { ...(value.entries ?? {}) },
     lastCleanupAt: value.lastCleanupAt,
     lastCleanupReason: value.lastCleanupReason,
     lastCleanupScanned: value.lastCleanupScanned,
