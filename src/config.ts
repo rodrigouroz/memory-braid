@@ -31,8 +31,9 @@ export type MemoryBraidConfig = {
   };
   entityExtraction: {
     enabled: boolean;
-    provider: "multilingual_ner";
+    provider: "multilingual_ner" | "openai";
     model: string;
+    timeoutMs: number;
     minScore: number;
     maxEntitiesPerMemory: number;
     startup: {
@@ -101,6 +102,7 @@ const DEFAULTS: MemoryBraidConfig = {
     enabled: false,
     provider: "multilingual_ner",
     model: "Xenova/bert-base-multilingual-cased-ner-hrl",
+    timeoutMs: 2500,
     minScore: 0.65,
     maxEntitiesPerMemory: 8,
     startup: {
@@ -184,6 +186,14 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     rawCaptureMode === "local" || rawCaptureMode === "hybrid" || rawCaptureMode === "ml"
       ? rawCaptureMode
       : DEFAULTS.capture.mode;
+  const entityProvider = entityExtraction.provider === "openai" ? "openai" : "multilingual_ner";
+  const parsedEntityModel = asString(entityExtraction.model);
+  const entityModel =
+    entityProvider === "openai"
+      ? parsedEntityModel && parsedEntityModel !== DEFAULTS.entityExtraction.model
+        ? parsedEntityModel
+        : "gpt-4o-mini"
+      : parsedEntityModel ?? DEFAULTS.entityExtraction.model;
 
   return {
     enabled: asBoolean(root.enabled, DEFAULTS.enabled),
@@ -221,11 +231,14 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     },
     entityExtraction: {
       enabled: asBoolean(entityExtraction.enabled, DEFAULTS.entityExtraction.enabled),
-      provider:
-        entityExtraction.provider === "multilingual_ner"
-          ? "multilingual_ner"
-          : DEFAULTS.entityExtraction.provider,
-      model: asString(entityExtraction.model) ?? DEFAULTS.entityExtraction.model,
+      provider: entityProvider,
+      model: entityModel,
+      timeoutMs: asInt(
+        entityExtraction.timeoutMs,
+        DEFAULTS.entityExtraction.timeoutMs,
+        250,
+        30_000,
+      ),
       minScore: asNumber(entityExtraction.minScore, DEFAULTS.entityExtraction.minScore, 0, 1),
       maxEntitiesPerMemory: asInt(
         entityExtraction.maxEntitiesPerMemory,

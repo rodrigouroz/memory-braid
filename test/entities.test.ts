@@ -1,5 +1,5 @@
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildCanonicalEntityUri, EntityExtractionManager, resolveEntityModelCacheDir } from "../src/entities.js";
 import { parseConfig } from "../src/config.js";
 import { MemoryBraidLogger } from "../src/logger.js";
@@ -44,6 +44,25 @@ describe("entity extraction helpers", () => {
     expect(status.cacheDir).toBe(
       path.join("/tmp/openclaw-state", "memory-braid", "models", "entity-extraction"),
     );
+  });
+
+  it("reports no local cache dir for openai provider", () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        provider: "openai",
+        model: "gpt-4o-mini",
+      },
+    });
+    const logger = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const manager = new EntityExtractionManager(cfg.entityExtraction, logger, {
+      stateDir: "/tmp/openclaw-state",
+    });
+
+    const status = manager.getStatus();
+    expect(status.enabled).toBe(true);
+    expect(status.provider).toBe("openai");
+    expect(status.cacheDir).toBe("n/a");
   });
 
   it("merges adjacent multi-word location tokens into one entity", async () => {
@@ -131,5 +150,65 @@ describe("entity extraction helpers", () => {
     const uris = entities.map((entity) => entity.canonicalUri);
     expect(uris).toContain("entity://location/buenos-aires");
     expect(uris).not.toContain("entity://location/go-rton-dent-on-america-buenos-aires");
+  });
+
+  it("extracts entities with openai provider while preserving canonical URIs", async () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        provider: "openai",
+        model: "gpt-4o-mini",
+        minScore: 0.6,
+      },
+    });
+    const logger = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const manager = new EntityExtractionManager(cfg.entityExtraction, logger);
+    const originalApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify([
+                { text: "Ana", type: "person", score: 0.92 },
+                { text: "OpenClaw", type: "organization", score: 0.87 },
+                { text: "Berlin", type: "location", score: 0.55 },
+                { text: "OpenClaw", type: "ORG", score: 0.9 },
+              ]),
+            },
+          },
+        ],
+      }),
+    })) as typeof fetch;
+
+    try {
+      const entities = await manager.extract({
+        text: "Ana works at OpenClaw in Berlin.",
+      });
+      expect(entities).toEqual([
+        {
+          text: "Ana",
+          type: "person",
+          score: 0.92,
+          canonicalUri: "entity://person/ana",
+        },
+        {
+          text: "OpenClaw",
+          type: "organization",
+          score: 0.9,
+          canonicalUri: "entity://organization/openclaw",
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (typeof originalApiKey === "string") {
+        process.env.OPENAI_API_KEY = originalApiKey;
+      } else {
+        delete process.env.OPENAI_API_KEY;
+      }
+    }
   });
 });

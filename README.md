@@ -7,7 +7,7 @@ Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory s
 - Hybrid recall: local memory + Mem0, merged with weighted RRF.
 - Capture-first Mem0 memory: plugin writes only captured memories to Mem0 (no markdown/session indexing).
 - Capture pipeline modes: `local`, `hybrid`, `ml`.
-- Optional entity extraction: multilingual NER with canonical `entity://...` URIs in memory metadata.
+- Optional entity extraction: local multilingual NER or OpenAI NER with canonical `entity://...` URIs in memory metadata.
 - Structured debug logs for troubleshooting and tuning.
 
 ## Breaking changes in 0.4.0
@@ -109,7 +109,7 @@ Note:
   - `fixCommand` (copy/paste command for that machine)
   - `pluginDir` (resolved extension directory when available)
 
-## Quick start: hybrid capture + multilingual NER
+## Quick start: hybrid capture + entity extraction
 
 Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
 
@@ -156,8 +156,9 @@ Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
   },
   "entityExtraction": {
     "enabled": true,
-    "provider": "multilingual_ner",
-    "model": "Xenova/bert-base-multilingual-cased-ner-hrl",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "timeoutMs": 2500,
     "minScore": 0.65,
     "maxEntitiesPerMemory": 8,
     "startup": {
@@ -167,6 +168,18 @@ Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
   },
   "debug": {
     "enabled": true
+  }
+}
+```
+
+Local-model alternative (fully backward compatible):
+
+```json
+{
+  "entityExtraction": {
+    "enabled": true,
+    "provider": "multilingual_ner",
+    "model": "Xenova/bert-base-multilingual-cased-ner-hrl"
   }
 }
 ```
@@ -186,7 +199,7 @@ openclaw plugins info memory-braid
 openclaw gateway status
 ```
 
-2. Trigger/inspect NER warmup:
+2. Trigger/inspect entity warmup:
 
 ```bash
 openclaw agent --agent main --message "/memorybraid warmup" --json
@@ -206,7 +219,7 @@ rg -n "memory_braid\\.startup|memory_braid\\.capture|memory_braid\\.entity|memor
 
 Expected events:
 - `memory_braid.startup`
-- `memory_braid.entity.model_load`
+- `memory_braid.entity.model_load` (local `multilingual_ner` provider only)
 - `memory_braid.entity.warmup`
 - `memory_braid.capture.extract`
 - `memory_braid.capture.ml` (for `capture.mode=hybrid|ml`)
@@ -436,8 +449,9 @@ Use this preset when:
       },
       "entityExtraction": {
         "enabled": true,
-        "provider": "multilingual_ner",
-        "model": "Xenova/bert-base-multilingual-cased-ner-hrl",
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "timeoutMs": 2500,
         "minScore": 0.65,
         "maxEntitiesPerMemory": 8,
         "startup": {
@@ -505,7 +519,8 @@ Entity extraction defaults are:
 
 - `entityExtraction.enabled`: `false`
 - `entityExtraction.provider`: `"multilingual_ner"`
-- `entityExtraction.model`: `"Xenova/bert-base-multilingual-cased-ner-hrl"`
+- `entityExtraction.model`: `"Xenova/bert-base-multilingual-cased-ner-hrl"` (or `"gpt-4o-mini"` when `provider: "openai"` and model is unset)
+- `entityExtraction.timeoutMs`: `2500`
 - `entityExtraction.minScore`: `0.65`
 - `entityExtraction.maxEntitiesPerMemory`: `8`
 - `entityExtraction.startup.downloadOnStartup`: `true`
@@ -513,9 +528,9 @@ Entity extraction defaults are:
 
 When enabled:
 
-- Model cache/download path is `<OPENCLAW_STATE_DIR>/memory-braid/models/entity-extraction` (typically `~/.openclaw/memory-braid/models/entity-extraction`).
+- Local NER model cache/download path is `<OPENCLAW_STATE_DIR>/memory-braid/models/entity-extraction` (typically `~/.openclaw/memory-braid/models/entity-extraction`).
 - Captured memories get `metadata.entities` and `metadata.entityUris` (canonical IDs like `entity://person/john-doe`).
-- Startup can pre-download/warm the model (`downloadOnStartup: true`).
+- Startup warmup runs for both providers (`downloadOnStartup: true`).
 
 Warmup command:
 

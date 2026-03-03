@@ -75,5 +75,33 @@ describe("parseConfig", () => {
     expect(cfg.lifecycle.reinforceOnRecall).toBe(false);
     expect(cfg.entityExtraction.enabled).toBe(true);
     expect(cfg.entityExtraction.provider).toBe("multilingual_ner");
+    expect(cfg.entityExtraction.timeoutMs).toBe(2500);
+  });
+
+  it("supports openai entity extraction provider with model fallback", () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        provider: "openai",
+      },
+    });
+
+    expect(cfg.entityExtraction.enabled).toBe(true);
+    expect(cfg.entityExtraction.provider).toBe("openai");
+    expect(cfg.entityExtraction.model).toBe("gpt-4o-mini");
+    expect(cfg.entityExtraction.timeoutMs).toBe(2500);
+  });
+
+  it("forces openai fallback model when local default model leaks into config", () => {
+    const cfg = parseConfig({
+      entityExtraction: {
+        enabled: true,
+        provider: "openai",
+        model: "Xenova/bert-base-multilingual-cased-ner-hrl",
+      },
+    });
+
+    expect(cfg.entityExtraction.provider).toBe("openai");
+    expect(cfg.entityExtraction.model).toBe("gpt-4o-mini");
   });
 });

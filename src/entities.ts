@@ -15,6 +15,15 @@ type NerRecord = {
   end?: unknown;
 };
 
+type LlmEntityRecord = {
+  text?: unknown;
+  type?: unknown;
+  label?: unknown;
+  entity?: unknown;
+  entity_group?: unknown;
+  score?: unknown;
+};
+
 export type ExtractedEntity = {
   text: string;
   type: "person" | "organization" | "location" | "misc";
@@ -79,6 +88,44 @@ function normalizeEntityText(raw: unknown): string {
     return "";
   }
   return normalizeWhitespace(raw.replace(/^##/, "").replace(/^▁/, ""));
+}
+
+function clampScore(value: unknown, fallback = 0): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return Math.max(0, Math.min(1, fallback));
+  }
+  return Math.max(0, Math.min(1, value));
+}
+
+function parseJsonObjectArray(raw: string): Array<Record<string, unknown>> {
+  const attempts = [raw.trim()];
+
+  const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]+?)\s*```/i);
+  if (fencedMatch?.[1]) {
+    attempts.push(fencedMatch[1].trim());
+  }
+
+  const firstBracket = raw.indexOf("[");
+  const lastBracket = raw.lastIndexOf("]");
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    attempts.push(raw.slice(firstBracket, lastBracket + 1).trim());
+  }
+
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt) as unknown;
+      if (!Array.isArray(parsed)) {
+        continue;
+      }
+      return parsed.filter((entry) => entry && typeof entry === "object") as Array<
+        Record<string, unknown>
+      >;
+    } catch {
+      continue;
+    }
+  }
+
+  return [];
 }
 
 type NormalizedEntityToken = {
@@ -213,6 +260,29 @@ function collapseAdjacentEntityTokens(
   return collapsed;
 }
 
+function dedupeAndLimitEntities(
+  entities: Array<Omit<ExtractedEntity, "canonicalUri">>,
+  maxEntities: number,
+): ExtractedEntity[] {
+  const deduped = new Map<string, ExtractedEntity>();
+  for (const entity of entities) {
+    const canonicalUri = buildCanonicalEntityUri(entity.type, entity.text);
+    const current = deduped.get(canonicalUri);
+    if (!current || entity.score > current.score) {
+      deduped.set(canonicalUri, {
+        text: entity.text,
+        type: entity.type,
+        score: entity.score,
+        canonicalUri,
+      });
+    }
+  }
+
+  return Array.from(deduped.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxEntities);
+}
+
 type EntityExtractionOptions = {
   stateDir?: string;
 };
@@ -256,7 +326,10 @@ export class EntityExtractionManager {
       model: this.cfg.model,
       minScore: this.cfg.minScore,
       maxEntitiesPerMemory: this.cfg.maxEntitiesPerMemory,
-      cacheDir: resolveEntityModelCacheDir(this.stateDir),
+      cacheDir:
+        this.cfg.provider === "multilingual_ner"
+          ? resolveEntityModelCacheDir(this.stateDir)
+          : "n/a",
     };
   }
 
@@ -274,10 +347,14 @@ export class EntityExtractionManager {
     error?: string;
   }> {
     const startedAt = Date.now();
+    const cacheDir =
+      this.cfg.provider === "multilingual_ner"
+        ? resolveEntityModelCacheDir(this.stateDir)
+        : "n/a";
     if (!this.cfg.enabled) {
       return {
         ok: false,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
+        cacheDir,
         model: this.cfg.model,
         entities: 0,
         durMs: Date.now() - startedAt,
@@ -285,29 +362,17 @@ export class EntityExtractionManager {
       };
     }
 
-    const pipeline = await this.ensurePipeline(params?.forceReload);
-    if (!pipeline) {
-      return {
-        ok: false,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
-        model: this.cfg.model,
-        entities: 0,
-        durMs: Date.now() - startedAt,
-        error: "model_load_failed",
-      };
-    }
-
     try {
-      const entities = await this.extractWithPipeline({
-        pipeline,
+      const entities = await this.extractWithProvider({
         text: params?.text ?? this.cfg.startup.warmupText,
+        forceReload: params?.forceReload,
       });
       this.log.info("memory_braid.entity.warmup", {
         runId: params?.runId,
         reason: params?.reason ?? "manual",
         provider: this.cfg.provider,
         model: this.cfg.model,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
+        cacheDir,
         entities: entities.length,
         entityTypes: summarizeEntityTypes(entities),
         sampleEntityUris: entities.slice(0, 5).map((entry) => entry.canonicalUri),
@@ -315,7 +380,7 @@ export class EntityExtractionManager {
       });
       return {
         ok: true,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
+        cacheDir,
         model: this.cfg.model,
         entities: entities.length,
         durMs: Date.now() - startedAt,
@@ -327,12 +392,12 @@ export class EntityExtractionManager {
         reason: params?.reason ?? "manual",
         provider: this.cfg.provider,
         model: this.cfg.model,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
+        cacheDir,
         error: message,
       });
       return {
         ok: false,
-        cacheDir: resolveEntityModelCacheDir(this.stateDir),
+        cacheDir,
         model: this.cfg.model,
         entities: 0,
         durMs: Date.now() - startedAt,
@@ -351,13 +416,8 @@ export class EntityExtractionManager {
       return [];
     }
 
-    const pipeline = await this.ensurePipeline();
-    if (!pipeline) {
-      return [];
-    }
-
     try {
-      const entities = await this.extractWithPipeline({ pipeline, text });
+      const entities = await this.extractWithProvider({ text });
       this.log.debug("memory_braid.entity.extract", {
         runId: params.runId,
         provider: this.cfg.provider,
@@ -378,8 +438,109 @@ export class EntityExtractionManager {
     }
   }
 
+  private async extractWithProvider(params: {
+    text: string;
+    forceReload?: boolean;
+  }): Promise<ExtractedEntity[]> {
+    if (this.cfg.provider === "openai") {
+      return this.extractWithOpenAi(params.text);
+    }
+
+    const pipeline = await this.ensurePipeline(params.forceReload);
+    if (!pipeline) {
+      throw new Error("model_load_failed");
+    }
+
+    return this.extractWithPipeline({ pipeline, text: params.text });
+  }
+
+  private async extractWithOpenAi(text: string): Promise<ExtractedEntity[]> {
+    const key = process.env.OPENAI_API_KEY?.trim();
+    if (!key) {
+      throw new Error("OPENAI_API_KEY is not set");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.cfg.timeoutMs);
+
+    try {
+      const prompt = [
+        "Extract named entities from this text.",
+        "Return ONLY JSON array.",
+        "Each item: {text:string, type:string, score:number}.",
+        "type must be one of: person, organization, location, misc.",
+        "score must be between 0 and 1.",
+        "Do not include duplicates.",
+        text,
+      ].join("\n");
+
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: this.cfg.model,
+          temperature: 0,
+          messages: [
+            {
+              role: "system",
+              content: "You return strict JSON only.",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+        signal: controller.signal,
+      });
+      const data = (await response.json()) as {
+        error?: { message?: string };
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+
+      if (!response.ok) {
+        throw new Error(data.error?.message ?? `OpenAI HTTP ${response.status}`);
+      }
+
+      const content = data.choices?.[0]?.message?.content ?? "";
+      const parsed = parseJsonObjectArray(content);
+
+      const normalized: Array<Omit<ExtractedEntity, "canonicalUri">> = [];
+      for (const row of parsed) {
+        const record = row as LlmEntityRecord;
+        const entityText = normalizeEntityText(record.text);
+        if (!entityText) {
+          continue;
+        }
+        const score = clampScore(record.score, 0.5);
+        if (score < this.cfg.minScore) {
+          continue;
+        }
+        const type = normalizeEntityType(
+          record.type ?? record.label ?? record.entity_group ?? record.entity,
+        );
+        normalized.push({
+          text: entityText,
+          type,
+          score,
+        });
+      }
+
+      return dedupeAndLimitEntities(normalized, this.cfg.maxEntitiesPerMemory);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async ensurePipeline(forceReload = false): Promise<NerPipeline | null> {
     if (!this.cfg.enabled) {
+      return null;
+    }
+
+    if (this.cfg.provider !== "multilingual_ner") {
       return null;
     }
 
@@ -463,7 +624,7 @@ export class EntityExtractionManager {
       if (!entityText) {
         continue;
       }
-      const score = typeof record.score === "number" ? Math.max(0, Math.min(1, record.score)) : 0;
+      const score = clampScore(record.score);
       if (score < this.cfg.minScore) {
         continue;
       }
@@ -479,22 +640,13 @@ export class EntityExtractionManager {
     }
 
     const collapsed = collapseAdjacentEntityTokens(normalized, params.text);
-    const deduped = new Map<string, ExtractedEntity>();
-    for (const token of collapsed) {
-      const canonicalUri = buildCanonicalEntityUri(token.type, token.text);
-      const current = deduped.get(canonicalUri);
-      if (!current || token.score > current.score) {
-        deduped.set(canonicalUri, {
-          text: token.text,
-          type: token.type,
-          score: token.score,
-          canonicalUri,
-        });
-      }
-    }
-
-    return Array.from(deduped.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, this.cfg.maxEntitiesPerMemory);
+    return dedupeAndLimitEntities(
+      collapsed.map((token) => ({
+        text: token.text,
+        type: token.type,
+        score: token.score,
+      })),
+      this.cfg.maxEntitiesPerMemory,
+    );
   }
 }

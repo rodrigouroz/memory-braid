@@ -72,13 +72,14 @@
           "enabled": { "type": "boolean", "default": false },
           "provider": {
             "type": "string",
-            "enum": ["multilingual_ner"],
+            "enum": ["multilingual_ner", "openai"],
             "default": "multilingual_ner"
           },
           "model": {
             "type": "string",
             "default": "Xenova/bert-base-multilingual-cased-ner-hrl"
           },
+          "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 30000, "default": 2500 },
           "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 },
           "maxEntitiesPerMemory": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 },
           "startup": {
