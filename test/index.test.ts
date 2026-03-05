@@ -364,6 +364,141 @@ describe("memory-braid plugin", () => {
     expect(result).toBeUndefined();
   });
 
+  it("skips recall when there is no new user turn in the same session", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        source: "mem0",
+        snippet: "User prefers afternoon standups.",
+        score: 0.8,
+      },
+    ]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    expect(beforeAgentStart).toBeTypeOf("function");
+
+    await beforeAgentStart!(
+      {
+        prompt: "What do I prefer for standups?",
+        messages: [
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    await beforeAgentStart!(
+      {
+        prompt: "Any relevant memory?",
+        messages: [
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+          {
+            role: "assistant",
+            content: "Noted.",
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips recall for excluded cron/subagent/acp sessions", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        source: "mem0",
+        snippet: "User prefers afternoon standups.",
+        score: 0.8,
+      },
+    ]);
+    const { api, hooks } = createApi();
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    expect(beforeAgentStart).toBeTypeOf("function");
+
+    await beforeAgentStart!(
+      {
+        prompt: "What should I remember?",
+        messages: [
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "agent:main:cron:job-1",
+      },
+    );
+
+    await beforeAgentStart!(
+      {
+        prompt: "What should I remember?",
+        messages: [
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "agent:main:subagent:child-1",
+      },
+    );
+
+    await beforeAgentStart!(
+      {
+        prompt: "What should I remember?",
+        messages: [
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "agent:main:acp:worker-1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(0);
+  });
+
   it("downranks stale low-overlap task memories before merge", async () => {
     const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
       {
@@ -536,6 +671,105 @@ describe("memory-braid plugin", () => {
     lifecycle = await readLifecycleState(createStatePaths(stateDir));
     expect(lifecycle.entries["m-1"]?.recallCount).toBe(1);
     expect(lifecycle.entries["m-1"]?.lastRecalledAt).toBeTypeOf("number");
+  });
+
+  it("skips capture when there is no new user turn in the same session", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+    expect(agentEndHook).toBeTypeOf("function");
+
+    await agentEndHook!(
+      {
+        success: true,
+        messages: [
+          {
+            role: "user",
+            content: "Remember that my timezone is PST and I prefer afternoon standups.",
+          },
+          {
+            role: "assistant",
+            content: "Noted.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    await agentEndHook!(
+      {
+        success: true,
+        messages: [
+          {
+            role: "user",
+            content: "Remember that my timezone is PST and I prefer afternoon standups.",
+          },
+          {
+            role: "assistant",
+            content: "Noted.",
+          },
+          {
+            role: "assistant",
+            content: "One more internal tool follow-up.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips capture for excluded cron/subagent/acp sessions", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+    expect(agentEndHook).toBeTypeOf("function");
+
+    for (const sessionKey of [
+      "agent:main:cron:job-1",
+      "agent:main:subagent:child-1",
+      "agent:main:acp:worker-1",
+    ]) {
+      await agentEndHook!(
+        {
+          success: true,
+          messages: [
+            {
+              role: "user",
+              content: "Remember that my timezone is PST and I prefer afternoon standups.",
+            },
+          ],
+        },
+        {
+          workspaceDir: path.join(tempDir, "workspace"),
+          agentId: "main",
+          sessionKey,
+        },
+      );
+    }
+
+    expect(addSpy).toHaveBeenCalledTimes(0);
   });
 
   it("deletes expired lifecycle memories via /memorybraid cleanup", async () => {

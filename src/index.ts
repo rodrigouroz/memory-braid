@@ -63,6 +63,107 @@ function resolveScopeFromHookContext(ctx: {
   };
 }
 
+function extractHookMessageText(content: unknown): string {
+  if (typeof content === "string") {
+    return normalizeWhitespace(content);
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const item = block as { type?: unknown; text?: unknown };
+    if (item.type === "text" && typeof item.text === "string") {
+      const normalized = normalizeWhitespace(item.text);
+      if (normalized) {
+        parts.push(normalized);
+      }
+    }
+  }
+  return parts.join(" ");
+}
+
+function normalizeHookMessages(messages: unknown[]): Array<{ role: string; text: string }> {
+  const out: Array<{ role: string; text: string }> = [];
+  for (const entry of messages) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const direct = entry as { role?: unknown; content?: unknown };
+    if (typeof direct.role === "string") {
+      const text = extractHookMessageText(direct.content);
+      if (text) {
+        out.push({ role: direct.role, text });
+      }
+      continue;
+    }
+
+    const wrapped = entry as { message?: { role?: unknown; content?: unknown } };
+    if (wrapped.message && typeof wrapped.message.role === "string") {
+      const text = extractHookMessageText(wrapped.message.content);
+      if (text) {
+        out.push({ role: wrapped.message.role, text });
+      }
+    }
+  }
+  return out;
+}
+
+function resolveLatestUserTurnSignature(messages?: unknown[]): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return undefined;
+  }
+
+  const normalized = normalizeHookMessages(messages);
+  for (let i = normalized.length - 1; i >= 0; i -= 1) {
+    const message = normalized[i];
+    if (!message || message.role !== "user") {
+      continue;
+    }
+    const hashSource = normalizeForHash(message.text);
+    if (!hashSource) {
+      continue;
+    }
+    return `${i}:${sha256(hashSource)}`;
+  }
+  return undefined;
+}
+
+function resolvePromptTurnSignature(prompt: string): string | undefined {
+  const normalized = normalizeForHash(prompt);
+  if (!normalized) {
+    return undefined;
+  }
+  return `prompt:${sha256(normalized)}`;
+}
+
+function resolveRunScopeKey(ctx: { agentId?: string; sessionKey?: string }): string {
+  const agentId = (ctx.agentId ?? "main").trim() || "main";
+  const sessionKey = (ctx.sessionKey ?? "main").trim() || "main";
+  return `${agentId}|${sessionKey}`;
+}
+
+function isExcludedAutoMemorySession(sessionKey?: string): boolean {
+  const normalized = (sessionKey ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.startsWith("cron:") ||
+    normalized.includes(":cron:") ||
+    normalized.includes(":subagent:") ||
+    normalized.startsWith("subagent:") ||
+    normalized.includes(":acp:") ||
+    normalized.startsWith("acp:") ||
+    normalized.startsWith("temp:")
+  );
+}
+
 function formatRelevantMemories(results: MemoryBraidResult[], maxChars = 600): string {
   const lines = results.map((entry, index) => {
     const sourceLabel = entry.source === "local" ? "local" : "mem0";
@@ -944,6 +1045,8 @@ const memoryBraidPlugin = {
     const entityExtraction = new EntityExtractionManager(cfg.entityExtraction, log, {
       stateDir: initialStateDir,
     });
+    const recallSeenByScope = new Map<string, string>();
+    const captureSeenByScope = new Map<string, string>();
 
     let lifecycleTimer: NodeJS.Timeout | null = null;
     let statePaths: StatePaths | null = null;
@@ -1231,10 +1334,48 @@ const memoryBraidPlugin = {
 
     api.on("before_agent_start", async (event, ctx) => {
       const runId = log.newRunId();
+      const scope = resolveScopeFromHookContext(ctx);
+      if (isExcludedAutoMemorySession(ctx.sessionKey)) {
+        log.debug("memory_braid.search.skip", {
+          runId,
+          reason: "session_scope_excluded",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+
       const recallQuery = sanitizeRecallQuery(event.prompt);
       if (!recallQuery) {
         return;
       }
+      const scopeKey = resolveRunScopeKey(ctx);
+      const userTurnSignature =
+        resolveLatestUserTurnSignature(event.messages) ?? resolvePromptTurnSignature(recallQuery);
+      if (!userTurnSignature) {
+        log.debug("memory_braid.search.skip", {
+          runId,
+          reason: "no_user_turn_signature",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+      const previousSignature = recallSeenByScope.get(scopeKey);
+      if (previousSignature === userTurnSignature) {
+        log.debug("memory_braid.search.skip", {
+          runId,
+          reason: "no_new_user_turn",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+      recallSeenByScope.set(scopeKey, userTurnSignature);
+
       const toolCtx: OpenClawPluginToolContext = {
         config: api.config,
         workspaceDir: ctx.workspaceDir,
@@ -1264,7 +1405,6 @@ const memoryBraidPlugin = {
         limit: cfg.recall.injectTopK,
       });
       if (selected.injected.length === 0) {
-        const scope = resolveScopeFromHookContext(ctx);
         log.debug("memory_braid.search.inject", {
           runId,
           agentId: scope.agentId,
@@ -1281,7 +1421,6 @@ const memoryBraidPlugin = {
       }
 
       const prependContext = formatRelevantMemories(selected.injected, cfg.debug.maxSnippetChars);
-      const scope = resolveScopeFromHookContext(ctx);
       log.debug("memory_braid.search.inject", {
         runId,
         agentId: scope.agentId,
@@ -1306,6 +1445,42 @@ const memoryBraidPlugin = {
       }
       const runId = log.newRunId();
       const scope = resolveScopeFromHookContext(ctx);
+      if (isExcludedAutoMemorySession(ctx.sessionKey)) {
+        log.debug("memory_braid.capture.skip", {
+          runId,
+          reason: "session_scope_excluded",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+
+      const scopeKey = resolveRunScopeKey(ctx);
+      const userTurnSignature = resolveLatestUserTurnSignature(event.messages);
+      if (!userTurnSignature) {
+        log.debug("memory_braid.capture.skip", {
+          runId,
+          reason: "no_user_turn_signature",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+      const previousSignature = captureSeenByScope.get(scopeKey);
+      if (previousSignature === userTurnSignature) {
+        log.debug("memory_braid.capture.skip", {
+          runId,
+          reason: "no_new_user_turn",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
+      captureSeenByScope.set(scopeKey, userTurnSignature);
+
       const candidates = await extractCandidates({
         messages: event.messages,
         cfg,
