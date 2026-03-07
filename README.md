@@ -9,6 +9,65 @@ Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory s
 - Capture pipeline modes: `local`, `hybrid`, `ml`.
 - Optional entity extraction: local multilingual NER or OpenAI NER with canonical `entity://...` URIs in memory metadata.
 - Structured debug logs for troubleshooting and tuning.
+- Debug-only LLM usage observability: per-turn cache usage, rolling windows, and rising/stable/improving trend logs.
+
+## Hardening update
+
+This release hardens capture and remediation for historical installs.
+
+- Bug class: historical prompt or transcript content could be captured as Mem0 memories and later re-injected.
+- Impact: inflated prompt size, noisier recall, and potentially higher Anthropic cache-write costs.
+- Fix: new captures are assembled from the trusted current turn instead of mining the full `agent_end` transcript.
+- Metadata: new captured memories now include additive provenance fields such as `captureOrigin`, `captureMessageHash`, `captureTurnHash`, `capturePath`, and `pluginCaptureVersion`.
+- Historical installs: no startup mutation is performed automatically. Operators should audit first, then explicitly quarantine or delete suspicious captured memories.
+
+## Remediation commands
+
+Memory Braid now exposes read-only audit and explicit remediation commands:
+
+```bash
+/memorybraid audit
+/memorybraid remediate audit
+/memorybraid remediate quarantine
+/memorybraid remediate quarantine --apply
+/memorybraid remediate delete --apply
+/memorybraid remediate purge-all-captured --apply
+```
+
+Notes:
+
+- Dry-run is the default for remediation commands. Nothing mutates until you pass `--apply`.
+- `audit` reports counts by `sourceType`, `captureOrigin`, and `pluginCaptureVersion`, plus suspicious legacy samples.
+- `quarantine --apply` excludes suspicious captured memories from future Mem0 injection. It records quarantine state locally and also tags Mem0 metadata where supported.
+- `delete --apply` deletes suspicious captured memories only.
+- `purge-all-captured --apply` deletes all plugin-captured Mem0 records for the current workspace scope without touching local markdown memory.
+- Optional flags:
+  - `--limit N` controls how many Mem0 records are fetched during audit/remediation.
+  - `--sample N` controls how many suspicious samples are shown in the audit report.
+
+## Debug cost observability
+
+When `debug.enabled` is `true`, Memory Braid also emits debug-only LLM usage observability logs from the `llm_output` hook:
+
+- `memory_braid.cost.turn`: per-turn input/output/cache tokens, cache ratios, and a best-effort estimated USD cost when the provider/model has a known pricing profile.
+- `memory_braid.cost.window`: rolling 5-turn and 20-turn averages plus `rising|stable|improving` trend labels for prompt size, cache-write rate, cache-hit rate, and estimated cost.
+- `memory_braid.cost.alert`: emitted only when recent cache writes, prompt size, or estimated cost rise materially above the previous short window.
+
+Important:
+
+- `estimatedCostUsd` is intentionally labeled as an estimate.
+- Unknown models still log token and cache trends, but the cost basis becomes `token_only`.
+
+## Self-hosted reset option
+
+If you are self-hosting and prefer a full reset instead of selective remediation, you can clear Memory Braid's OSS Mem0 state and restart OpenClaw:
+
+```bash
+rm -rf ~/.openclaw/memory-braid
+openclaw gateway restart
+```
+
+This is intentionally not done by the plugin itself. It is an operator choice.
 
 ## Breaking changes in 0.4.0
 

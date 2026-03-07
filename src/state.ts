@@ -4,6 +4,7 @@ import type {
   CaptureDedupeState,
   LifecycleState,
   PluginStatsState,
+  RemediationState,
 } from "./types.js";
 
 const DEFAULT_CAPTURE_DEDUPE: CaptureDedupeState = {
@@ -30,7 +31,19 @@ const DEFAULT_STATS: PluginStatsState = {
     mem0AddWithoutId: 0,
     entityAnnotatedCandidates: 0,
     totalEntitiesAttached: 0,
+    trustedTurns: 0,
+    fallbackTurnSlices: 0,
+    provenanceSkipped: 0,
+    transcriptShapeSkipped: 0,
+    quarantinedFiltered: 0,
+    remediationQuarantined: 0,
+    remediationDeleted: 0,
   },
+};
+
+const DEFAULT_REMEDIATION: RemediationState = {
+  version: 1,
+  quarantined: {},
 };
 
 export type StatePaths = {
@@ -38,6 +51,7 @@ export type StatePaths = {
   captureDedupeFile: string;
   lifecycleFile: string;
   statsFile: string;
+  remediationFile: string;
   stateLockFile: string;
 };
 
@@ -48,6 +62,7 @@ export function createStatePaths(stateDir: string): StatePaths {
     captureDedupeFile: path.join(rootDir, "capture-dedupe.v1.json"),
     lifecycleFile: path.join(rootDir, "lifecycle.v1.json"),
     statsFile: path.join(rootDir, "stats.v1.json"),
+    remediationFile: path.join(rootDir, "remediation.v1.json"),
     stateLockFile: path.join(rootDir, "state.v1.lock"),
   };
 }
@@ -119,6 +134,21 @@ export async function readStatsState(paths: StatePaths): Promise<PluginStatsStat
 
 export async function writeStatsState(paths: StatePaths, state: PluginStatsState): Promise<void> {
   await writeJsonFile(paths.statsFile, state);
+}
+
+export async function readRemediationState(paths: StatePaths): Promise<RemediationState> {
+  const value = await readJsonFile(paths.remediationFile, DEFAULT_REMEDIATION);
+  return {
+    version: 1,
+    quarantined: { ...(value.quarantined ?? {}) },
+  };
+}
+
+export async function writeRemediationState(
+  paths: StatePaths,
+  state: RemediationState,
+): Promise<void> {
+  await writeJsonFile(paths.remediationFile, state);
 }
 
 export async function withStateLock<T>(

@@ -1,5 +1,11 @@
 export type MemoryBraidSource = "local" | "mem0";
 
+export const PLUGIN_CAPTURE_VERSION = "2026-03-provenance-v1";
+
+export type CaptureOrigin = "external_user" | "assistant_derived";
+
+export type CapturePath = "before_message_write" | "agent_end_last_turn";
+
 export type ScopeKey = {
   workspaceHash: string;
   agentId: string;
@@ -62,7 +68,15 @@ export type CaptureStats = {
   mem0AddWithoutId: number;
   entityAnnotatedCandidates: number;
   totalEntitiesAttached: number;
+  trustedTurns: number;
+  fallbackTurnSlices: number;
+  provenanceSkipped: number;
+  transcriptShapeSkipped: number;
+  quarantinedFiltered: number;
+  remediationQuarantined: number;
+  remediationDeleted: number;
   lastRunAt?: string;
+  lastRemediationAt?: string;
 };
 
 export type PluginStatsState = {
@@ -75,4 +89,37 @@ export type ExtractedCandidate = {
   category: "preference" | "decision" | "fact" | "task" | "other";
   score: number;
   source: "heuristic" | "ml";
+};
+
+export type PendingInboundTurn = {
+  text: string;
+  messageHash: string;
+  receivedAt: number;
+};
+
+export type CaptureInputMessage = {
+  role: "user" | "assistant";
+  text: string;
+  origin: CaptureOrigin;
+  messageHash: string;
+};
+
+export type AssembledCaptureInput = {
+  messages: CaptureInputMessage[];
+  capturePath: CapturePath;
+  turnHash: string;
+  fallbackUsed: boolean;
+};
+
+export type RemediationState = {
+  version: 1;
+  quarantined: Record<
+    string,
+    {
+      memoryId: string;
+      reason: string;
+      quarantinedAt: string;
+      updatedRemotely?: boolean;
+    }
+  >;
 };

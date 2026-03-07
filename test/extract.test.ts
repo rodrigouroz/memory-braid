@@ -77,6 +77,28 @@ describe("extractCandidates role filtering", () => {
     expect(candidates.some((entry) => entry.text.includes("prefer black coffee"))).toBe(true);
   });
 
+  it("skips pasted multi-speaker transcripts", async () => {
+    const cfg = parseConfig({
+      capture: {
+        mode: "local",
+      },
+    });
+    const log = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const candidates = await extractCandidates({
+      messages: [
+        {
+          role: "user",
+          content:
+            "User: I prefer black coffee.\nAssistant: Noted.\nUser: Deploy every Friday afternoon.",
+        },
+      ],
+      cfg,
+      log,
+    });
+
+    expect(candidates).toEqual([]);
+  });
+
   it("skips hybrid ML enrichment when no heuristic candidates are found", async () => {
     const cfg = parseConfig({
       capture: {

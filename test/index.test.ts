@@ -8,6 +8,7 @@ import {
   createStatePaths,
   readCaptureDedupeState,
   readLifecycleState,
+  readRemediationState,
   readStatsState,
   withStateLock,
   writeLifecycleState,
@@ -101,7 +102,7 @@ describe("memory-braid plugin", () => {
 
     expect(tools).toHaveLength(1);
     expect(hooks.map((item) => item.name)).toEqual(
-      expect.arrayContaining(["before_agent_start", "agent_end"]),
+      expect.arrayContaining(["before_agent_start", "before_message_write", "agent_end"]),
     );
     expect(services.map((service) => service.id)).toContain("memory-braid-service");
     expect(commands.map((command) => command.name)).toContain("memorybraid");
@@ -139,6 +140,240 @@ describe("memory-braid plugin", () => {
     expect(addSpy).toHaveBeenCalledTimes(1);
     const dedupe = await readCaptureDedupeState(createStatePaths(stateDir));
     expect(Object.keys(dedupe.seen)).toHaveLength(0);
+  });
+
+  it("captures only the trusted external user turn instead of the full transcript", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const beforeWrite = hooks.find((entry) => entry.name === "before_message_write")?.handler as
+      | ((event: unknown) => Promise<void>)
+      | undefined;
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [{ type: "text", text: "Remember that I prefer black coffee in the morning." }],
+      },
+    });
+
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [
+          {
+            role: "user",
+            content:
+              "System: imported wrapper\n\nConversation info:\n```json\n{\"sender\":\"Rod\"}\n```",
+          },
+          {
+            role: "assistant",
+            content: "Earlier assistant note that should not be captured.",
+          },
+          {
+            role: "toolResult",
+            content: "Remember that secret tool results exist.",
+          },
+          {
+            role: "assistant",
+            content: "Noted.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Remember that I prefer black coffee in the morning.",
+        metadata: expect.objectContaining({
+          captureOrigin: "external_user",
+          capturePath: "before_message_write",
+        }),
+      }),
+    );
+  });
+
+  it("captures only trailing assistant content from the current turn when includeAssistant is enabled", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({
+      stateDir,
+      pluginConfig: {
+        capture: {
+          includeAssistant: true,
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeWrite = hooks.find((entry) => entry.name === "before_message_write")?.handler as
+      | ((event: unknown) => Promise<void>)
+      | undefined;
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [{ type: "text", text: "short note" }],
+      },
+    });
+
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [
+          {
+            role: "assistant",
+            content: "Remember that we used to deploy every Tuesday afternoon.",
+          },
+          {
+            role: "user",
+            content: "short note",
+          },
+          {
+            role: "assistant",
+            content: "Remember that we decided to deploy every Friday afternoon.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Remember that we decided to deploy every Friday afternoon.",
+        metadata: expect.objectContaining({
+          captureOrigin: "assistant_derived",
+        }),
+      }),
+    );
+  });
+
+  it("falls back to the last user turn and ignores earlier history and tool results", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [
+          {
+            role: "user",
+            content: "Remember that my old favorite drink was orange juice.",
+          },
+          {
+            role: "assistant",
+            content: "Remember that we used to deploy every Tuesday afternoon.",
+          },
+          {
+            role: "toolResult",
+            content: "Remember that tool outputs can contain all sorts of junk.",
+          },
+          {
+            role: "user",
+            content: "Remember that I prefer afternoon standups.",
+          },
+          {
+            role: "assistant",
+            content: "Noted.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Remember that I prefer afternoon standups.",
+        metadata: expect.objectContaining({
+          capturePath: "agent_end_last_turn",
+        }),
+      }),
+    );
+  });
+
+  it("rejects pasted multi-speaker transcripts from capture", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const beforeWrite = hooks.find((entry) => entry.name === "before_message_write")?.handler as
+      | ((event: unknown) => Promise<void>)
+      | undefined;
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [
+          {
+            type: "text",
+            text: "User: I prefer black coffee.\nAssistant: Noted.\nUser: Deploy every Friday afternoon.",
+          },
+        ],
+      },
+    });
+
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(0);
+    const stats = await readStatsState(createStatePaths(stateDir));
+    expect(stats.capture.transcriptShapeSkipped).toBeGreaterThanOrEqual(0);
   });
 
   it("does not hold the state lock while mem0 add is in flight", async () => {
@@ -846,5 +1081,154 @@ describe("memory-braid plugin", () => {
     expect(lifecycle.entries.fresh).toBeTruthy();
     expect(lifecycle.lastCleanupDeleted).toBe(1);
     expect(lifecycle.lastCleanupExpired).toBe(1);
+  });
+
+  it("audits legacy captured memories and reports missing provenance", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    vi.spyOn(Mem0Adapter.prototype, "getAllMemories").mockResolvedValue([
+      {
+        id: "legacy-1",
+        source: "mem0",
+        snippet: "Remember that I prefer black coffee in the morning.",
+        score: 0.9,
+        metadata: { sourceType: "capture" },
+      },
+      {
+        id: "clean-1",
+        source: "mem0",
+        snippet: "Remember that I prefer afternoon standups.",
+        score: 0.8,
+        metadata: {
+          sourceType: "capture",
+          captureOrigin: "external_user",
+          capturePath: "before_message_write",
+          pluginCaptureVersion: "2026-03-provenance-v1",
+        },
+      },
+    ]);
+    const { api, commands } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const command = commands.find((entry) => entry.name === "memorybraid");
+    const result = (await command?.handler({
+      args: "audit",
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "/memorybraid audit",
+      config: api.config,
+    })) as { text?: string };
+
+    expect(result.text).toContain("Memory Braid remediation audit");
+    expect(result.text).toContain("legacy_capture_missing_provenance");
+    expect(result.text).toContain("suspicious: 1");
+  });
+
+  it("quarantines suspicious memories and excludes them from later injection", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const getAllSpy = vi.spyOn(Mem0Adapter.prototype, "getAllMemories").mockResolvedValue([
+      {
+        id: "legacy-1",
+        source: "mem0",
+        snippet:
+          "User: I prefer black coffee.\nAssistant: Noted.\nUser: Deploy every Friday afternoon.",
+        score: 0.9,
+        metadata: { sourceType: "capture" },
+      },
+    ]);
+    const updateSpy = vi.spyOn(Mem0Adapter.prototype, "updateMemoryMetadata").mockResolvedValue(true);
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        id: "legacy-1",
+        source: "mem0",
+        snippet:
+          "User: I prefer black coffee.\nAssistant: Noted.\nUser: Deploy every Friday afternoon.",
+        score: 0.9,
+        metadata: { sourceType: "capture" },
+      },
+    ]);
+    const { api, commands, hooks } = createApi({
+      stateDir,
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const command = commands.find((entry) => entry.name === "memorybraid");
+    await command?.handler({
+      args: "remediate quarantine --apply",
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "/memorybraid remediate quarantine --apply",
+      config: api.config,
+    });
+
+    expect(getAllSpy).toHaveBeenCalledTimes(1);
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    const remediation = await readRemediationState(createStatePaths(stateDir));
+    expect(remediation.quarantined["legacy-1"]).toBeTruthy();
+
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    const result = await beforeAgentStart?.(
+      {
+        prompt: "What do I prefer to drink?",
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+  });
+
+  it("purges only plugin-captured memories during remediation delete", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    vi.spyOn(Mem0Adapter.prototype, "getAllMemories").mockResolvedValue([
+      {
+        id: "capture-1",
+        source: "mem0",
+        snippet: "Remember that I prefer black coffee.",
+        score: 0.9,
+        metadata: { sourceType: "capture" },
+      },
+      {
+        id: "other-1",
+        source: "mem0",
+        snippet: "Non-capture memory should survive.",
+        score: 0.8,
+        metadata: { sourceType: "session" },
+      },
+    ]);
+    const deleteSpy = vi.spyOn(Mem0Adapter.prototype, "deleteMemory").mockResolvedValue(true);
+    const { api, commands } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const command = commands.find((entry) => entry.name === "memorybraid");
+    await command?.handler({
+      args: "remediate purge-all-captured --apply",
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "/memorybraid remediate purge-all-captured --apply",
+      config: api.config,
+    });
+
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        memoryId: "capture-1",
+      }),
+    );
   });
 });

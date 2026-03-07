@@ -1,5 +1,10 @@
-import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { MemoryBraidResult } from "./types.js";
+
+type ToolContext = {
+  config?: unknown;
+  sessionKey?: string;
+};
 
 type AnyTool = {
   name: string;
@@ -44,17 +49,17 @@ function extractDetailsPayload(value: unknown): unknown {
   return tryParseTextPayload(value);
 }
 
-export function resolveLocalTools(api: OpenClawPluginApi, ctx: OpenClawPluginToolContext): {
+export function resolveLocalTools(api: OpenClawPluginApi, ctx: ToolContext): {
   searchTool: AnyTool | null;
   getTool: AnyTool | null;
 } {
   const searchTool = api.runtime.tools.createMemorySearchTool({
-    config: ctx.config,
+    config: ctx.config as never,
     agentSessionKey: ctx.sessionKey,
   }) as unknown as AnyTool | null;
 
   const getTool = api.runtime.tools.createMemoryGetTool({
-    config: ctx.config,
+    config: ctx.config as never,
     agentSessionKey: ctx.sessionKey,
   }) as unknown as AnyTool | null;
 

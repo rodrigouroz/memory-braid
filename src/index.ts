@@ -1,8 +1,13 @@
 import path from "node:path";
-import type {
-  OpenClawPluginApi,
-  OpenClawPluginToolContext,
-} from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import {
+  assembleCaptureInput,
+  getPendingInboundTurn,
+  isLikelyTranscriptLikeText,
+  isOversizedAtomicMemory,
+  matchCandidateToCaptureInput,
+  normalizeHookMessages,
+} from "./capture.js";
 import { parseConfig, pluginConfigSchema } from "./config.js";
 import { stagedDedupe } from "./dedupe.js";
 import { EntityExtractionManager } from "./entities.js";
@@ -12,19 +17,48 @@ import { resolveLocalTools, runLocalGet, runLocalSearch } from "./local-memory.j
 import { Mem0Adapter } from "./mem0-client.js";
 import { mergeWithRrf } from "./merge.js";
 import {
+  appendUsageWindow,
+  createUsageSnapshot,
+  summarizeUsageWindow,
+  type UsageWindowEntry,
+} from "./observability.js";
+import {
+  buildAuditSummary,
+  buildQuarantineMetadata,
+  formatAuditSummary,
+  isQuarantinedMemory,
+  selectRemediationTargets,
+  type RemediationAction,
+} from "./remediation.js";
+import {
   createStatePaths,
   ensureStateDir,
   readCaptureDedupeState,
   readLifecycleState,
+  readRemediationState,
   readStatsState,
   type StatePaths,
   withStateLock,
   writeCaptureDedupeState,
   writeLifecycleState,
+  writeRemediationState,
   writeStatsState,
 } from "./state.js";
-import type { LifecycleEntry, MemoryBraidResult, ScopeKey } from "./types.js";
+import type {
+  LifecycleEntry,
+  MemoryBraidResult,
+  PendingInboundTurn,
+  ScopeKey,
+} from "./types.js";
+import { PLUGIN_CAPTURE_VERSION } from "./types.js";
 import { normalizeForHash, normalizeWhitespace, sha256 } from "./chunking.js";
+
+type ToolContext = {
+  config?: unknown;
+  workspaceDir?: string;
+  agentId?: string;
+  sessionKey?: string;
+};
 
 function jsonToolResult(payload: unknown) {
   return {
@@ -43,7 +77,7 @@ function workspaceHashFromDir(workspaceDir?: string): string {
   return sha256(base.toLowerCase());
 }
 
-function resolveScopeFromToolContext(ctx: OpenClawPluginToolContext): ScopeKey {
+function resolveScopeFromToolContext(ctx: ToolContext): ScopeKey {
   return {
     workspaceHash: workspaceHashFromDir(ctx.workspaceDir),
     agentId: (ctx.agentId ?? "main").trim() || "main",
@@ -63,55 +97,23 @@ function resolveScopeFromHookContext(ctx: {
   };
 }
 
-function extractHookMessageText(content: unknown): string {
-  if (typeof content === "string") {
-    return normalizeWhitespace(content);
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
-
-  const parts: string[] = [];
-  for (const block of content) {
-    if (!block || typeof block !== "object") {
-      continue;
-    }
-    const item = block as { type?: unknown; text?: unknown };
-    if (item.type === "text" && typeof item.text === "string") {
-      const normalized = normalizeWhitespace(item.text);
-      if (normalized) {
-        parts.push(normalized);
-      }
-    }
-  }
-  return parts.join(" ");
+function resolveWorkspaceDirFromConfig(config?: unknown): string | undefined {
+  const root = asRecord(config);
+  const agents = asRecord(root.agents);
+  const defaults = asRecord(agents.defaults);
+  const workspace =
+    typeof defaults.workspace === "string" ? defaults.workspace.trim() : "";
+  return workspace || undefined;
 }
 
-function normalizeHookMessages(messages: unknown[]): Array<{ role: string; text: string }> {
-  const out: Array<{ role: string; text: string }> = [];
-  for (const entry of messages) {
-    if (!entry || typeof entry !== "object") {
-      continue;
-    }
-
-    const direct = entry as { role?: unknown; content?: unknown };
-    if (typeof direct.role === "string") {
-      const text = extractHookMessageText(direct.content);
-      if (text) {
-        out.push({ role: direct.role, text });
-      }
-      continue;
-    }
-
-    const wrapped = entry as { message?: { role?: unknown; content?: unknown } };
-    if (wrapped.message && typeof wrapped.message.role === "string") {
-      const text = extractHookMessageText(wrapped.message.content);
-      if (text) {
-        out.push({ role: wrapped.message.role, text });
-      }
-    }
-  }
-  return out;
+function resolveCommandScope(config?: unknown): {
+  workspaceHash: string;
+  agentId?: string;
+  sessionKey?: string;
+} {
+  return {
+    workspaceHash: workspaceHashFromDir(resolveWorkspaceDirFromConfig(config)),
+  };
 }
 
 function resolveLatestUserTurnSignature(messages?: unknown[]): string | undefined {
@@ -664,15 +666,19 @@ function applyTemporalDecayToMem0(params: {
 }
 
 function resolveLifecycleReferenceTs(entry: LifecycleEntry, reinforceOnRecall: boolean): number {
-  const capturedTs = Number.isFinite(entry.lastCapturedAt)
-    ? entry.lastCapturedAt
-    : Number.isFinite(entry.createdAt)
-      ? entry.createdAt
-      : 0;
+  const capturedTs =
+    typeof entry.lastCapturedAt === "number" && Number.isFinite(entry.lastCapturedAt)
+      ? entry.lastCapturedAt
+      : typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+        ? entry.createdAt
+        : 0;
   if (!reinforceOnRecall) {
     return capturedTs;
   }
-  const recalledTs = Number.isFinite(entry.lastRecalledAt) ? entry.lastRecalledAt : 0;
+  const recalledTs =
+    typeof entry.lastRecalledAt === "number" && Number.isFinite(entry.lastRecalledAt)
+      ? entry.lastRecalledAt
+      : 0;
   return Math.max(capturedTs, recalledTs);
 }
 
@@ -852,7 +858,7 @@ async function runHybridRecall(params: {
   cfg: ReturnType<typeof parseConfig>;
   mem0: Mem0Adapter;
   log: MemoryBraidLogger;
-  ctx: OpenClawPluginToolContext;
+  ctx: ToolContext;
   statePaths?: StatePaths | null;
   query: string;
   toolCallId?: string;
@@ -910,9 +916,21 @@ async function runHybridRecall(params: {
     scope,
     runId: params.runId,
   });
+  const remediationState = params.statePaths
+    ? await readRemediationState(params.statePaths)
+    : undefined;
+  let quarantinedFiltered = 0;
   const mem0Search = mem0Raw.filter((result) => {
     const sourceType = asRecord(result.metadata).sourceType;
-    return sourceType !== "markdown" && sourceType !== "session";
+    if (sourceType === "markdown" || sourceType === "session") {
+      return false;
+    }
+    const quarantine = isQuarantinedMemory(result, remediationState);
+    if (quarantine.quarantined) {
+      quarantinedFiltered += 1;
+      return false;
+    }
+    return true;
   });
   let mem0ForMerge = mem0Search;
   if (params.cfg.timeDecay.enabled) {
@@ -962,6 +980,7 @@ async function runHybridRecall(params: {
     sessionKey: scope.sessionKey,
     workspaceHash: scope.workspaceHash,
     inputCount: mem0Search.length,
+    quarantinedFiltered,
     adjusted: qualityAdjusted.adjusted,
     overlapBoosted: qualityAdjusted.overlapBoosted,
     overlapPenalized: qualityAdjusted.overlapPenalized,
@@ -1030,6 +1049,188 @@ async function runHybridRecall(params: {
   };
 }
 
+function parseIntegerFlag(tokens: string[], flag: string, fallback: number): number {
+  const index = tokens.findIndex((token) => token === flag);
+  if (index < 0 || index === tokens.length - 1) {
+    return fallback;
+  }
+  const raw = Number(tokens[index + 1]);
+  if (!Number.isFinite(raw)) {
+    return fallback;
+  }
+  return Math.max(1, Math.round(raw));
+}
+
+function resolveRecordScope(
+  memory: MemoryBraidResult,
+  fallbackScope: { workspaceHash: string; agentId?: string; sessionKey?: string },
+): ScopeKey {
+  const metadata = asRecord(memory.metadata);
+  const workspaceHash =
+    typeof metadata.workspaceHash === "string" && metadata.workspaceHash.trim()
+      ? metadata.workspaceHash
+      : fallbackScope.workspaceHash;
+  const agentId =
+    typeof metadata.agentId === "string" && metadata.agentId.trim()
+      ? metadata.agentId
+      : fallbackScope.agentId ?? "main";
+  const sessionKey =
+    typeof metadata.sessionKey === "string" && metadata.sessionKey.trim()
+      ? metadata.sessionKey
+      : fallbackScope.sessionKey;
+  return {
+    workspaceHash,
+    agentId,
+    sessionKey,
+  };
+}
+
+async function runRemediationAction(params: {
+  action: RemediationAction;
+  apply: boolean;
+  mem0: Mem0Adapter;
+  statePaths: StatePaths;
+  scope: { workspaceHash: string; agentId?: string; sessionKey?: string };
+  log: MemoryBraidLogger;
+  runId: string;
+  fetchLimit: number;
+  sampleLimit: number;
+}): Promise<string> {
+  const memories = await params.mem0.getAllMemories({
+    scope: params.scope,
+    limit: params.fetchLimit,
+    runId: params.runId,
+  });
+  const remediationState = await readRemediationState(params.statePaths);
+  const summary = buildAuditSummary({
+    records: memories,
+    remediationState,
+    sampleLimit: params.sampleLimit,
+  });
+  if (params.action === "audit") {
+    return formatAuditSummary(summary);
+  }
+
+  const targets = selectRemediationTargets(summary, params.action);
+  if (!params.apply) {
+    return [
+      formatAuditSummary(summary),
+      "",
+      `Dry run: ${params.action}`,
+      `- targets: ${targets.length}`,
+      "Add --apply to mutate Mem0 state.",
+    ].join("\n");
+  }
+
+  const nowIso = new Date().toISOString();
+  let updated = 0;
+  let remoteTagged = 0;
+  let deleted = 0;
+  const quarantinedUpdates: Array<{
+    id: string;
+    reason: string;
+    updatedRemotely: boolean;
+  }> = [];
+  const deletedIds = new Set<string>();
+
+  if (params.action === "quarantine") {
+    for (const target of targets) {
+      const memoryId = target.memory.id;
+      if (!memoryId) {
+        continue;
+      }
+      const reason = target.suspiciousReasons.join(",");
+      const updatedRemotely = await params.mem0.updateMemoryMetadata({
+        memoryId,
+        scope: resolveRecordScope(target.memory, params.scope),
+        text: target.memory.snippet,
+        metadata: buildQuarantineMetadata(asRecord(target.memory.metadata), reason, nowIso),
+        runId: params.runId,
+      });
+      quarantinedUpdates.push({
+        id: memoryId,
+        reason,
+        updatedRemotely,
+      });
+      updated += 1;
+      if (updatedRemotely) {
+        remoteTagged += 1;
+      }
+    }
+
+    await withStateLock(params.statePaths.stateLockFile, async () => {
+      const nextRemediation = await readRemediationState(params.statePaths);
+      const stats = await readStatsState(params.statePaths);
+      for (const update of quarantinedUpdates) {
+        nextRemediation.quarantined[update.id] = {
+          memoryId: update.id,
+          reason: update.reason,
+          quarantinedAt: nowIso,
+          updatedRemotely: update.updatedRemotely,
+        };
+      }
+      stats.capture.remediationQuarantined += quarantinedUpdates.length;
+      stats.capture.lastRemediationAt = nowIso;
+      await writeRemediationState(params.statePaths, nextRemediation);
+      await writeStatsState(params.statePaths, stats);
+    });
+
+    return [
+      formatAuditSummary(summary),
+      "",
+      "Remediation applied.",
+      `- action: quarantine`,
+      `- targets: ${targets.length}`,
+      `- quarantined: ${updated}`,
+      `- remoteMetadataUpdated: ${remoteTagged}`,
+      `- localQuarantineState: ${quarantinedUpdates.length}`,
+    ].join("\n");
+  }
+
+  for (const target of targets) {
+    const memoryId = target.memory.id;
+    if (!memoryId) {
+      continue;
+    }
+    const ok = await params.mem0.deleteMemory({
+      memoryId,
+      scope: resolveRecordScope(target.memory, params.scope),
+      runId: params.runId,
+    });
+    if (!ok) {
+      continue;
+    }
+    deleted += 1;
+    deletedIds.add(memoryId);
+  }
+
+  await withStateLock(params.statePaths.stateLockFile, async () => {
+    const nextRemediation = await readRemediationState(params.statePaths);
+    const lifecycle = await readLifecycleState(params.statePaths);
+    const stats = await readStatsState(params.statePaths);
+
+    for (const memoryId of deletedIds) {
+      delete nextRemediation.quarantined[memoryId];
+      delete lifecycle.entries[memoryId];
+    }
+
+    stats.capture.remediationDeleted += deletedIds.size;
+    stats.capture.lastRemediationAt = nowIso;
+    await writeRemediationState(params.statePaths, nextRemediation);
+    await writeLifecycleState(params.statePaths, lifecycle);
+    await writeStatsState(params.statePaths, stats);
+  });
+
+  return [
+    formatAuditSummary(summary),
+    "",
+    "Remediation applied.",
+    `- action: ${params.action}`,
+    `- targets: ${targets.length}`,
+    `- deleted: ${deleted}`,
+  ].join("\n");
+}
+
 const memoryBraidPlugin = {
   id: "memory-braid",
   name: "Memory Braid",
@@ -1047,6 +1248,8 @@ const memoryBraidPlugin = {
     });
     const recallSeenByScope = new Map<string, string>();
     const captureSeenByScope = new Map<string, string>();
+    const pendingInboundTurns = new Map<string, PendingInboundTurn>();
+    const usageByRunScope = new Map<string, UsageWindowEntry[]>();
 
     let lifecycleTimer: NodeJS.Timeout | null = null;
     let statePaths: StatePaths | null = null;
@@ -1135,8 +1338,10 @@ const memoryBraidPlugin = {
         };
 
         const getTool = {
-          ...local.getTool,
           name: "memory_get",
+          label: local.getTool.label ?? "Memory Get",
+          description: local.getTool.description ?? "Read a specific local memory entry.",
+          parameters: local.getTool.parameters,
           execute: async (
             toolCallId: string,
             args: Record<string, unknown>,
@@ -1162,14 +1367,14 @@ const memoryBraidPlugin = {
           },
         };
 
-        return [searchTool, getTool];
+        return [searchTool, getTool] as never;
       },
       { names: ["memory_search", "memory_get"] },
     );
 
     api.registerCommand({
       name: "memorybraid",
-      description: "Memory Braid status, stats, lifecycle cleanup, and entity extraction warmup.",
+      description: "Memory Braid status, stats, remediation, lifecycle cleanup, and entity extraction warmup.",
       acceptsArgs: true,
       handler: async (ctx) => {
         const args = ctx.args?.trim() ?? "";
@@ -1243,7 +1448,15 @@ const memoryBraidPlugin = {
               `- mem0AddAttempts: ${capture.mem0AddAttempts}`,
               `- mem0AddWithId: ${capture.mem0AddWithId} (${mem0SuccessRate})`,
               `- mem0AddWithoutId: ${capture.mem0AddWithoutId} (${mem0NoIdRate})`,
+              `- trustedTurns: ${capture.trustedTurns}`,
+              `- fallbackTurnSlices: ${capture.fallbackTurnSlices}`,
+              `- provenanceSkipped: ${capture.provenanceSkipped}`,
+              `- transcriptShapeSkipped: ${capture.transcriptShapeSkipped}`,
+              `- quarantinedFiltered: ${capture.quarantinedFiltered}`,
+              `- remediationQuarantined: ${capture.remediationQuarantined}`,
+              `- remediationDeleted: ${capture.remediationDeleted}`,
               `- lastRunAt: ${capture.lastRunAt ?? "n/a"}`,
+              `- lastRemediationAt: ${capture.lastRemediationAt ?? "n/a"}`,
               "",
               "Lifecycle:",
               `- enabled: ${cfg.lifecycle.enabled}`,
@@ -1258,6 +1471,44 @@ const memoryBraidPlugin = {
               `- lastCleanupDeleted: ${lifecycle.lastCleanupDeleted ?? "n/a"}`,
               `- lastCleanupFailed: ${lifecycle.lastCleanupFailed ?? "n/a"}`,
             ].join("\n"),
+          };
+        }
+
+        if (action === "audit" || action === "remediate") {
+          const subAction = action === "audit" ? "audit" : (tokens[1] ?? "audit").toLowerCase();
+          if (
+            subAction !== "audit" &&
+            subAction !== "quarantine" &&
+            subAction !== "delete" &&
+            subAction !== "purge-all-captured"
+          ) {
+            return {
+              text:
+                "Usage: /memorybraid remediate [audit|quarantine|delete|purge-all-captured] [--apply] [--limit N] [--sample N]",
+              isError: true,
+            };
+          }
+
+          const paths = await ensureRuntimeStatePaths();
+          if (!paths) {
+            return {
+              text: "Remediation unavailable: state directory is not ready.",
+              isError: true,
+            };
+          }
+
+          return {
+            text: await runRemediationAction({
+              action: subAction as RemediationAction,
+              apply: tokens.includes("--apply"),
+              mem0,
+              statePaths: paths,
+              scope: resolveCommandScope(ctx.config),
+              log,
+              runId: log.newRunId(),
+              fetchLimit: parseIntegerFlag(tokens, "--limit", 500),
+              sampleLimit: parseIntegerFlag(tokens, "--sample", 5),
+            }),
           };
         }
 
@@ -1327,9 +1578,120 @@ const memoryBraidPlugin = {
         }
 
         return {
-          text: "Usage: /memorybraid [status|stats|cleanup|warmup [--force]]",
+          text:
+            "Usage: /memorybraid [status|stats|audit|remediate <audit|quarantine|delete|purge-all-captured> [--apply] [--limit N] [--sample N]|cleanup|warmup [--force]]",
         };
       },
+    });
+
+    api.on("before_message_write", (event) => {
+      const pending = getPendingInboundTurn(event.message);
+      if (!pending) {
+        return;
+      }
+      const scopeKey = resolveRunScopeKey({
+        agentId: event.agentId,
+        sessionKey: event.sessionKey,
+      });
+      pendingInboundTurns.set(scopeKey, pending);
+    });
+
+    api.on("llm_output", (event, ctx) => {
+      if (!cfg.debug.enabled || !event.usage) {
+        return;
+      }
+
+      const scope = resolveScopeFromHookContext(ctx);
+      const scopeKey = `${scope.workspaceHash}|${scope.agentId}|${ctx.sessionKey ?? event.sessionId}|${event.provider}|${event.model}`;
+      const snapshot = createUsageSnapshot({
+        provider: event.provider,
+        model: event.model,
+        usage: event.usage,
+      });
+      const entry: UsageWindowEntry = {
+        ...snapshot,
+        at: Date.now(),
+        runId: event.runId,
+      };
+      const history = appendUsageWindow(usageByRunScope.get(scopeKey) ?? [], entry);
+      usageByRunScope.set(scopeKey, history);
+      const summary = summarizeUsageWindow(history);
+
+      log.debug("memory_braid.cost.turn", {
+        runId: event.runId,
+        workspaceHash: scope.workspaceHash,
+        agentId: scope.agentId,
+        sessionKey: ctx.sessionKey,
+        provider: event.provider,
+        model: event.model,
+        input: snapshot.input,
+        output: snapshot.output,
+        cacheRead: snapshot.cacheRead,
+        cacheWrite: snapshot.cacheWrite,
+        promptTokens: snapshot.promptTokens,
+        cacheHitRate: Number(snapshot.cacheHitRate.toFixed(4)),
+        cacheWriteRate: Number(snapshot.cacheWriteRate.toFixed(4)),
+        estimatedCostUsd:
+          typeof snapshot.estimatedCostUsd === "number"
+            ? Number(snapshot.estimatedCostUsd.toFixed(6))
+            : undefined,
+        costEstimateBasis: snapshot.costEstimateBasis,
+      });
+
+      log.debug("memory_braid.cost.window", {
+        runId: event.runId,
+        workspaceHash: scope.workspaceHash,
+        agentId: scope.agentId,
+        sessionKey: ctx.sessionKey,
+        provider: event.provider,
+        model: event.model,
+        turnsSeen: summary.turnsSeen,
+        window5PromptTokens: Math.round(summary.window5.avgPromptTokens),
+        window5CacheRead: Math.round(summary.window5.avgCacheRead),
+        window5CacheWrite: Math.round(summary.window5.avgCacheWrite),
+        window5CacheHitRate: Number(summary.window5.avgCacheHitRate.toFixed(4)),
+        window5CacheWriteRate: Number(summary.window5.avgCacheWriteRate.toFixed(4)),
+        window5EstimatedCostUsd:
+          typeof summary.window5.avgEstimatedCostUsd === "number"
+            ? Number(summary.window5.avgEstimatedCostUsd.toFixed(6))
+            : undefined,
+        window20PromptTokens: Math.round(summary.window20.avgPromptTokens),
+        window20CacheRead: Math.round(summary.window20.avgCacheRead),
+        window20CacheWrite: Math.round(summary.window20.avgCacheWrite),
+        window20CacheHitRate: Number(summary.window20.avgCacheHitRate.toFixed(4)),
+        window20CacheWriteRate: Number(summary.window20.avgCacheWriteRate.toFixed(4)),
+        window20EstimatedCostUsd:
+          typeof summary.window20.avgEstimatedCostUsd === "number"
+            ? Number(summary.window20.avgEstimatedCostUsd.toFixed(6))
+            : undefined,
+        cacheWriteTrend: summary.trends.cacheWriteRate,
+        cacheHitTrend: summary.trends.cacheHitRate,
+        promptTokensTrend: summary.trends.promptTokens,
+        estimatedCostTrend: summary.trends.estimatedCostUsd,
+        costEstimateBasis: snapshot.costEstimateBasis,
+      });
+
+      if (summary.alerts.length > 0) {
+        log.debug("memory_braid.cost.alert", {
+          runId: event.runId,
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: ctx.sessionKey,
+          provider: event.provider,
+          model: event.model,
+          alerts: summary.alerts,
+          cacheWriteTrend: summary.trends.cacheWriteRate,
+          promptTokensTrend: summary.trends.promptTokens,
+          estimatedCostTrend: summary.trends.estimatedCostUsd,
+          window5CacheWriteRate: Number(summary.window5.avgCacheWriteRate.toFixed(4)),
+          window5PromptTokens: Math.round(summary.window5.avgPromptTokens),
+          window5EstimatedCostUsd:
+            typeof summary.window5.avgEstimatedCostUsd === "number"
+              ? Number(summary.window5.avgEstimatedCostUsd.toFixed(6))
+              : undefined,
+          costEstimateBasis: snapshot.costEstimateBasis,
+        });
+      }
     });
 
     api.on("before_agent_start", async (event, ctx) => {
@@ -1376,7 +1738,7 @@ const memoryBraidPlugin = {
       }
       recallSeenByScope.set(scopeKey, userTurnSignature);
 
-      const toolCtx: OpenClawPluginToolContext = {
+      const toolCtx: ToolContext = {
         config: api.config,
         workspaceDir: ctx.workspaceDir,
         agentId: ctx.agentId,
@@ -1457,8 +1819,11 @@ const memoryBraidPlugin = {
       }
 
       const scopeKey = resolveRunScopeKey(ctx);
-      const userTurnSignature = resolveLatestUserTurnSignature(event.messages);
+      const pendingInboundTurn = pendingInboundTurns.get(scopeKey);
+      const userTurnSignature =
+        pendingInboundTurn?.messageHash ?? resolveLatestUserTurnSignature(event.messages);
       if (!userTurnSignature) {
+        pendingInboundTurns.delete(scopeKey);
         log.debug("memory_braid.capture.skip", {
           runId,
           reason: "no_user_turn_signature",
@@ -1470,6 +1835,7 @@ const memoryBraidPlugin = {
       }
       const previousSignature = captureSeenByScope.get(scopeKey);
       if (previousSignature === userTurnSignature) {
+        pendingInboundTurns.delete(scopeKey);
         log.debug("memory_braid.capture.skip", {
           runId,
           reason: "no_new_user_turn",
@@ -1480,21 +1846,73 @@ const memoryBraidPlugin = {
         return;
       }
       captureSeenByScope.set(scopeKey, userTurnSignature);
+      pendingInboundTurns.delete(scopeKey);
+
+      const captureInput = assembleCaptureInput({
+        messages: event.messages,
+        includeAssistant: cfg.capture.includeAssistant,
+        pendingInboundTurn,
+      });
+      if (!captureInput) {
+        log.debug("memory_braid.capture.skip", {
+          runId,
+          reason: "no_capture_input",
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+        });
+        return;
+      }
 
       const candidates = await extractCandidates({
-        messages: event.messages,
+        messages: captureInput.messages.map((message) => ({
+          role: message.role,
+          content: message.text,
+        })),
         cfg,
         log,
         runId,
       });
       const runtimeStatePaths = await ensureRuntimeStatePaths();
+      let provenanceSkipped = 0;
+      let transcriptShapeSkipped = 0;
+      const candidateEntries = candidates
+        .map((candidate) => {
+          if (isLikelyTranscriptLikeText(candidate.text) || isOversizedAtomicMemory(candidate.text)) {
+            transcriptShapeSkipped += 1;
+            return null;
+          }
+          const matchedSource = matchCandidateToCaptureInput(candidate.text, captureInput.messages);
+          if (!matchedSource) {
+            provenanceSkipped += 1;
+            return null;
+          }
+          return {
+            candidate,
+            matchedSource,
+            hash: sha256(normalizeForHash(candidate.text)),
+          };
+        })
+        .filter(
+          (
+            entry,
+          ): entry is {
+            candidate: (typeof candidates)[number];
+            matchedSource: (typeof captureInput.messages)[number];
+            hash: string;
+          } => Boolean(entry),
+        );
 
-      if (candidates.length === 0) {
+      if (candidateEntries.length === 0) {
         if (runtimeStatePaths) {
           await withStateLock(runtimeStatePaths.stateLockFile, async () => {
             const stats = await readStatsState(runtimeStatePaths);
             stats.capture.runs += 1;
             stats.capture.runsNoCandidates += 1;
+            stats.capture.trustedTurns += 1;
+            stats.capture.fallbackTurnSlices += captureInput.fallbackUsed ? 1 : 0;
+            stats.capture.provenanceSkipped += provenanceSkipped;
+            stats.capture.transcriptShapeSkipped += transcriptShapeSkipped;
             stats.capture.lastRunAt = new Date().toISOString();
             await writeStatsState(runtimeStatePaths, stats);
           });
@@ -1502,6 +1920,10 @@ const memoryBraidPlugin = {
         log.debug("memory_braid.capture.skip", {
           runId,
           reason: "no_candidates",
+          capturePath: captureInput.capturePath,
+          fallbackUsed: captureInput.fallbackUsed,
+          provenanceSkipped,
+          transcriptShapeSkipped,
           workspaceHash: scope.workspaceHash,
           agentId: scope.agentId,
           sessionKey: scope.sessionKey,
@@ -1521,11 +1943,6 @@ const memoryBraidPlugin = {
       }
 
       const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-      const candidateEntries = candidates.map((candidate) => ({
-        candidate,
-        hash: sha256(normalizeForHash(candidate.text)),
-      }));
-
       const prepared = await withStateLock(runtimeStatePaths.stateLockFile, async () => {
         const dedupe = await readCaptureDedupeState(runtimeStatePaths);
         const now = Date.now();
@@ -1565,6 +1982,8 @@ const memoryBraidPlugin = {
       let mem0AddAttempts = 0;
       let mem0AddWithId = 0;
       let mem0AddWithoutId = 0;
+      let remoteQuarantineFiltered = 0;
+      const remediationState = await readRemediationState(runtimeStatePaths);
       const successfulAdds: Array<{
         memoryId: string;
         hash: string;
@@ -1572,7 +1991,7 @@ const memoryBraidPlugin = {
       }> = [];
 
       for (const entry of prepared.pending) {
-        const { candidate, hash } = entry;
+        const { candidate, hash, matchedSource } = entry;
         const metadata: Record<string, unknown> = {
           sourceType: "capture",
           workspaceHash: scope.workspaceHash,
@@ -1581,6 +2000,11 @@ const memoryBraidPlugin = {
           category: candidate.category,
           captureScore: candidate.score,
           extractionSource: candidate.source,
+          captureOrigin: matchedSource.origin,
+          captureMessageHash: matchedSource.messageHash,
+          captureTurnHash: captureInput.turnHash,
+          capturePath: captureInput.capturePath,
+          pluginCaptureVersion: PLUGIN_CAPTURE_VERSION,
           contentHash: hash,
           indexedAt: new Date().toISOString(),
         };
@@ -1596,6 +2020,17 @@ const memoryBraidPlugin = {
             metadata.entityUris = entities.map((entity) => entity.canonicalUri);
             metadata.entities = entities;
           }
+        }
+
+        const quarantine = isQuarantinedMemory({
+          ...entry.candidate,
+          source: "mem0",
+          snippet: entry.candidate.text,
+          metadata,
+        }, remediationState);
+        if (quarantine.quarantined) {
+          remoteQuarantineFiltered += 1;
+          continue;
         }
 
         mem0AddAttempts += 1;
@@ -1673,6 +2108,11 @@ const memoryBraidPlugin = {
         stats.capture.mem0AddWithoutId += mem0AddWithoutId;
         stats.capture.entityAnnotatedCandidates += entityAnnotatedCandidates;
         stats.capture.totalEntitiesAttached += totalEntitiesAttached;
+        stats.capture.trustedTurns += 1;
+        stats.capture.fallbackTurnSlices += captureInput.fallbackUsed ? 1 : 0;
+        stats.capture.provenanceSkipped += provenanceSkipped;
+        stats.capture.transcriptShapeSkipped += transcriptShapeSkipped;
+        stats.capture.quarantinedFiltered += remoteQuarantineFiltered;
         stats.capture.lastRunAt = new Date(now).toISOString();
 
         await writeCaptureDedupeState(runtimeStatePaths, dedupe);
@@ -1686,9 +2126,14 @@ const memoryBraidPlugin = {
           workspaceHash: scope.workspaceHash,
           agentId: scope.agentId,
           sessionKey: scope.sessionKey,
+          capturePath: captureInput.capturePath,
+          fallbackUsed: captureInput.fallbackUsed,
           candidates: candidates.length,
           pending: prepared.pending.length,
           dedupeSkipped: prepared.dedupeSkipped,
+          provenanceSkipped,
+          transcriptShapeSkipped,
+          quarantinedFiltered: remoteQuarantineFiltered,
           persisted,
           mem0AddAttempts,
           mem0AddWithId,

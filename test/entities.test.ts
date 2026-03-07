@@ -182,7 +182,7 @@ describe("entity extraction helpers", () => {
           },
         ],
       }),
-    })) as typeof fetch;
+    })) as unknown as typeof fetch;
 
     try {
       const entities = await manager.extract({

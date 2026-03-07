@@ -1,5 +1,6 @@
 import { normalizeForHash, normalizeWhitespace, sha256 } from "./chunking.js";
 import type { MemoryBraidConfig } from "./config.js";
+import { isLikelyTranscriptLikeText, isOversizedAtomicMemory } from "./capture.js";
 import { MemoryBraidLogger } from "./logger.js";
 import type { ExtractedCandidate } from "./types.js";
 
@@ -18,6 +19,9 @@ const FEED_TAG_PATTERN = /\[(?:n8n|rss|alert|news|cron|slack|discord|telegram|em
 const ROLE_LABEL_PATTERN = /\b(?:assistant|system|tool|developer)\s*:/gi;
 
 function isLikelyFeedOrImportedText(text: string): boolean {
+  if (isLikelyTranscriptLikeText(text) || isOversizedAtomicMemory(text)) {
+    return true;
+  }
   if (FEED_TAG_PATTERN.test(text)) {
     return true;
   }
@@ -396,6 +400,9 @@ function applyMlExtractionResult(
     const rawText = typeof item.text === "string" ? item.text : "";
     const text = normalizeWhitespace(rawText);
     if (!text || text.length < 20 || text.length > 3000) {
+      continue;
+    }
+    if (isLikelyFeedOrImportedText(text)) {
       continue;
     }
     const key = sha256(normalizeForHash(text));

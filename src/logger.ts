@@ -99,10 +99,15 @@ export class MemoryBraidLogger {
       return;
     }
 
+    const sanitizedContext = sanitizeValue(
+      context,
+      this.cfg.maxSnippetChars,
+      this.cfg.includePayloads,
+    );
     const payload = {
       event,
       ts: new Date().toISOString(),
-      ...sanitizeValue(context, this.cfg.maxSnippetChars, this.cfg.includePayloads),
+      ...(sanitizedContext && typeof sanitizedContext === "object" ? sanitizedContext : {}),
     };
     const message = `memory-braid ${JSON.stringify(payload)}`;
 

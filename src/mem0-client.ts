@@ -12,6 +12,8 @@ type CloudRecord = {
   memory?: string;
   data?: { memory?: string } | null;
   score?: number;
+  created_at?: string | Date;
+  updated_at?: string | Date;
   metadata?: Record<string, unknown> | null;
 };
 
@@ -20,7 +22,17 @@ type CloudClientLike = {
     messages: Array<{ role: "user" | "assistant"; content: string }>,
     options?: Record<string, unknown>,
   ) => Promise<CloudRecord[]>;
+  get: (memoryId: string) => Promise<CloudRecord>;
+  getAll: (options?: Record<string, unknown>) => Promise<CloudRecord[]>;
   search: (query: string, options?: Record<string, unknown>) => Promise<CloudRecord[]>;
+  update: (
+    memoryId: string,
+    data: {
+      text?: string;
+      metadata?: Record<string, unknown>;
+      timestamp?: number | string;
+    },
+  ) => Promise<CloudRecord[]>;
   delete: (memoryId: string) => Promise<unknown>;
 };
 
@@ -28,6 +40,8 @@ type OssRecord = {
   id?: string;
   memory?: string;
   score?: number;
+  createdAt?: string;
+  updatedAt?: string;
   metadata?: Record<string, unknown>;
 };
 
@@ -41,7 +55,16 @@ type OssClientLike = {
     messages: string | Array<{ role: string; content: string }>,
     options: Record<string, unknown>,
   ) => Promise<OssSearchResult>;
+  get?: (memoryId: string) => Promise<OssRecord | null>;
+  getAll: (options: Record<string, unknown>) => Promise<OssSearchResult>;
   search: (query: string, options: Record<string, unknown>) => Promise<OssSearchResult>;
+  update?: (memoryId: string, data: string) => Promise<{ message: string }>;
+  updateMemory?: (
+    memoryId: string,
+    data: string,
+    embeddings?: Record<string, number[]>,
+    metadata?: Record<string, unknown>,
+  ) => Promise<unknown>;
   delete: (memoryId: string) => Promise<{ message: string }>;
 };
 
@@ -72,20 +95,37 @@ function normalizeMetadata(value: unknown): Record<string, unknown> | undefined 
   return value as Record<string, unknown>;
 }
 
-function buildCloudEntity(scope: ScopeKey): { user_id: string; agent_id: string; run_id?: string } {
+function normalizeTimestamp(value: unknown): string | undefined {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+type ScopeFilter = {
+  workspaceHash: string;
+  agentId?: string;
+  sessionKey?: string;
+};
+
+function buildCloudEntity(scope: ScopeFilter): { user_id: string; agent_id?: string; run_id?: string } {
   const userId = `memory-braid:${scope.workspaceHash}`;
   return {
     user_id: userId,
-    agent_id: scope.agentId,
+    ...(scope.agentId ? { agent_id: scope.agentId } : {}),
     run_id: scope.sessionKey,
   };
 }
 
-function buildOssEntity(scope: ScopeKey): { userId: string; agentId: string; runId?: string } {
+function buildOssEntity(scope: ScopeFilter): { userId: string; agentId?: string; runId?: string } {
   const userId = `memory-braid:${scope.workspaceHash}`;
   return {
     userId,
-    agentId: scope.agentId,
+    ...(scope.agentId ? { agentId: scope.agentId } : {}),
     runId: scope.sessionKey,
   };
 }
@@ -260,6 +300,52 @@ function resolveStateDir(explicitStateDir?: string): string {
     process.env.OPENCLAW_STATE_DIR?.trim() ||
     path.join(os.homedir(), ".openclaw");
   return path.resolve(resolved);
+}
+
+function mapCloudRecord(record: CloudRecord): MemoryBraidResult | null {
+  const snippet = extractCloudText(record);
+  if (!snippet) {
+    return null;
+  }
+  const metadata = normalizeMetadata(record.metadata);
+  return {
+    id: record.id,
+    source: "mem0",
+    path: typeof metadata?.path === "string" ? metadata.path : undefined,
+    snippet,
+    score: typeof record.score === "number" ? record.score : 0,
+    metadata: {
+      ...(metadata ?? {}),
+      ...(normalizeTimestamp(record.created_at) ? { createdAt: normalizeTimestamp(record.created_at) } : {}),
+      ...(normalizeTimestamp(record.updated_at) ? { updatedAt: normalizeTimestamp(record.updated_at) } : {}),
+    },
+    chunkKey: typeof metadata?.chunkKey === "string" ? metadata.chunkKey : undefined,
+    contentHash:
+      typeof metadata?.contentHash === "string" ? metadata.contentHash : undefined,
+  };
+}
+
+function mapOssRecord(record: OssRecord): MemoryBraidResult | null {
+  const snippet = typeof record.memory === "string" ? record.memory.trim() : "";
+  if (!snippet) {
+    return null;
+  }
+  const metadata = normalizeMetadata(record.metadata);
+  return {
+    id: record.id,
+    source: "mem0",
+    path: typeof metadata?.path === "string" ? metadata.path : undefined,
+    snippet,
+    score: typeof record.score === "number" ? record.score : 0,
+    metadata: {
+      ...(metadata ?? {}),
+      ...(normalizeTimestamp(record.createdAt) ? { createdAt: normalizeTimestamp(record.createdAt) } : {}),
+      ...(normalizeTimestamp(record.updatedAt) ? { updatedAt: normalizeTimestamp(record.updatedAt) } : {}),
+    },
+    chunkKey: typeof metadata?.chunkKey === "string" ? metadata.chunkKey : undefined,
+    contentHash:
+      typeof metadata?.contentHash === "string" ? metadata.contentHash : undefined,
+  };
 }
 
 export function resolveDefaultOssStoragePaths(stateDir?: string): {
@@ -640,8 +726,9 @@ export class Mem0Adapter {
 
     try {
       if (prepared.mode === "cloud") {
+        const client = prepared.client as CloudClientLike;
         const entity = buildCloudEntity(params.scope);
-        const result = await prepared.client.add(
+        const result = await client.add(
           [{ role: "user", content: params.text }],
           {
             ...entity,
@@ -662,8 +749,9 @@ export class Mem0Adapter {
         return { id };
       }
 
+      const client = prepared.client as OssClientLike;
       const entity = buildOssEntity(params.scope);
-      const result = await prepared.client.add([{ role: "user", content: params.text }], {
+      const result = await client.add([{ role: "user", content: params.text }], {
         ...entity,
         metadata: params.metadata,
         infer: true,
@@ -717,58 +805,25 @@ export class Mem0Adapter {
     try {
       let mapped: MemoryBraidResult[] = [];
       if (prepared.mode === "cloud") {
+        const client = prepared.client as CloudClientLike;
         const entity = buildCloudEntity(params.scope);
-        const records = await prepared.client.search(params.query, {
+        const records = await client.search(params.query, {
           ...entity,
           limit: params.maxResults,
         });
-
         mapped = records
-          .map((record) => {
-            const snippet = extractCloudText(record);
-            if (!snippet) {
-              return null;
-            }
-            const metadata = normalizeMetadata(record.metadata);
-            return {
-              id: record.id,
-              source: "mem0" as const,
-              path: typeof metadata?.path === "string" ? metadata.path : undefined,
-              snippet,
-              score: typeof record.score === "number" ? record.score : 0,
-              metadata,
-              chunkKey: typeof metadata?.chunkKey === "string" ? metadata.chunkKey : undefined,
-              contentHash:
-                typeof metadata?.contentHash === "string" ? metadata.contentHash : undefined,
-            };
-          })
+          .map((record) => mapCloudRecord(record))
           .filter((entry): entry is MemoryBraidResult => Boolean(entry));
       } else {
+        const client = prepared.client as OssClientLike;
         const entity = buildOssEntity(params.scope);
-        const result = await prepared.client.search(params.query, {
+        const result = await client.search(params.query, {
           ...entity,
           limit: params.maxResults,
         });
         const records = result.results ?? [];
         mapped = records
-          .map((record) => {
-            const snippet = typeof record.memory === "string" ? record.memory.trim() : "";
-            if (!snippet) {
-              return null;
-            }
-            const metadata = normalizeMetadata(record.metadata);
-            return {
-              id: record.id,
-              source: "mem0" as const,
-              path: typeof metadata?.path === "string" ? metadata.path : undefined,
-              snippet,
-              score: typeof record.score === "number" ? record.score : 0,
-              metadata,
-              chunkKey: typeof metadata?.chunkKey === "string" ? metadata.chunkKey : undefined,
-              contentHash:
-                typeof metadata?.contentHash === "string" ? metadata.contentHash : undefined,
-            };
-          })
+          .map((record) => mapOssRecord(record))
           .filter((entry): entry is MemoryBraidResult => Boolean(entry));
       }
 
@@ -794,6 +849,201 @@ export class Mem0Adapter {
         error: err instanceof Error ? err.message : String(err),
       });
       return [];
+    }
+  }
+
+  async getMemory(params: {
+    memoryId?: string;
+    scope: ScopeFilter;
+    runId?: string;
+  }): Promise<MemoryBraidResult | undefined> {
+    if (!params.memoryId) {
+      return undefined;
+    }
+
+    const prepared = await this.ensureClient();
+    if (!prepared) {
+      return undefined;
+    }
+
+    const startedAt = Date.now();
+    try {
+      if (prepared.mode === "cloud") {
+        const client = prepared.client as CloudClientLike;
+        const record = await client.get(params.memoryId);
+        const mapped = mapCloudRecord(record);
+        this.log.debug("memory_braid.mem0.response", {
+          runId: params.runId,
+          action: "get",
+          mode: prepared.mode,
+          workspaceHash: params.scope.workspaceHash,
+          agentId: params.scope.agentId,
+          durMs: Date.now() - startedAt,
+          found: Boolean(mapped),
+        });
+        return mapped ?? undefined;
+      }
+
+      const client = prepared.client as OssClientLike;
+      if (!client.get) {
+        return undefined;
+      }
+      const record = await client.get(params.memoryId);
+      const mapped = record ? mapOssRecord(record) : null;
+      this.log.debug("memory_braid.mem0.response", {
+        runId: params.runId,
+        action: "get",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        found: Boolean(mapped),
+      });
+      return mapped ?? undefined;
+    } catch (err) {
+      this.log.warn("memory_braid.mem0.error", {
+        runId: params.runId,
+        action: "get",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return undefined;
+    }
+  }
+
+  async getAllMemories(params: {
+    scope: ScopeFilter;
+    limit?: number;
+    runId?: string;
+  }): Promise<MemoryBraidResult[]> {
+    const prepared = await this.ensureClient();
+    if (!prepared) {
+      return [];
+    }
+
+    const startedAt = Date.now();
+    const limit = Math.max(1, Math.min(2000, Math.round(params.limit ?? 500)));
+    try {
+      let mapped: MemoryBraidResult[] = [];
+      if (prepared.mode === "cloud") {
+        const client = prepared.client as CloudClientLike;
+        const entity = buildCloudEntity(params.scope);
+        const pageSize = Math.min(100, limit);
+        const records: CloudRecord[] = [];
+        let page = 1;
+
+        while (records.length < limit) {
+          const batch = await client.getAll({
+            ...entity,
+            page,
+            page_size: pageSize,
+          });
+          if (!Array.isArray(batch) || batch.length === 0) {
+            break;
+          }
+          records.push(...batch);
+          if (batch.length < pageSize) {
+            break;
+          }
+          page += 1;
+        }
+
+        mapped = records
+          .slice(0, limit)
+          .map((record) => mapCloudRecord(record))
+          .filter((entry): entry is MemoryBraidResult => Boolean(entry));
+      } else {
+        const client = prepared.client as OssClientLike;
+        const entity = buildOssEntity(params.scope);
+        const result = await client.getAll({
+          ...entity,
+          limit,
+        });
+        mapped = (result.results ?? [])
+          .map((record) => mapOssRecord(record))
+          .filter((entry): entry is MemoryBraidResult => Boolean(entry));
+      }
+
+      this.log.debug("memory_braid.mem0.response", {
+        runId: params.runId,
+        action: "get_all",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        count: mapped.length,
+      });
+      return mapped;
+    } catch (err) {
+      this.log.warn("memory_braid.mem0.error", {
+        runId: params.runId,
+        action: "get_all",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    }
+  }
+
+  async updateMemoryMetadata(params: {
+    memoryId?: string;
+    scope: ScopeFilter;
+    text: string;
+    metadata: Record<string, unknown>;
+    runId?: string;
+  }): Promise<boolean> {
+    if (!params.memoryId) {
+      return false;
+    }
+
+    const prepared = await this.ensureClient();
+    if (!prepared) {
+      return false;
+    }
+
+    const startedAt = Date.now();
+    try {
+      if (prepared.mode === "cloud") {
+        const client = prepared.client as CloudClientLike;
+        await client.update(params.memoryId, {
+          text: params.text,
+          metadata: params.metadata,
+        });
+      } else {
+        const client = prepared.client as OssClientLike;
+        if (typeof client.updateMemory !== "function") {
+          return false;
+        }
+        await client.updateMemory(params.memoryId, params.text, {}, params.metadata);
+      }
+
+      this.log.debug("memory_braid.mem0.response", {
+        runId: params.runId,
+        action: "update_metadata",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        updated: true,
+      });
+      return true;
+    } catch (err) {
+      this.log.warn("memory_braid.mem0.error", {
+        runId: params.runId,
+        action: "update_metadata",
+        mode: prepared.mode,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        durMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
     }
   }
 
