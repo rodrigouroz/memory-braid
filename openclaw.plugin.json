@@ -30,6 +30,24 @@
         "properties": {
           "maxResults": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 },
           "injectTopK": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 },
+          "user": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "injectTopK": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 }
+            }
+          },
+          "agent": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "injectTopK": { "type": "integer", "minimum": 1, "maximum": 20, "default": 2 },
+              "minScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.78 },
+              "onlyPlanning": { "type": "boolean", "default": true }
+            }
+          },
           "merge": {
             "type": "object",
             "additionalProperties": false,
@@ -54,6 +72,20 @@
           },
           "includeAssistant": { "type": "boolean", "default": false },
           "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 6 },
+          "assistant": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "autoCapture": { "type": "boolean", "default": false },
+              "explicitTool": { "type": "boolean", "default": true },
+              "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
+              "minUtilityScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 },
+              "minNoveltyScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.85 },
+              "maxWritesPerSessionWindow": { "type": "integer", "minimum": 1, "maximum": 20, "default": 3 },
+              "cooldownMinutes": { "type": "integer", "minimum": 0, "maximum": 240, "default": 5 }
+            }
+          },
           "ml": {
             "type": "object",
             "additionalProperties": false,

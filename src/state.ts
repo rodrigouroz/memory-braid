@@ -38,6 +38,15 @@ const DEFAULT_STATS: PluginStatsState = {
     quarantinedFiltered: 0,
     remediationQuarantined: 0,
     remediationDeleted: 0,
+    agentLearningToolCalls: 0,
+    agentLearningAccepted: 0,
+    agentLearningRejectedValidation: 0,
+    agentLearningRejectedNovelty: 0,
+    agentLearningRejectedCooldown: 0,
+    agentLearningAutoCaptured: 0,
+    agentLearningAutoRejected: 0,
+    agentLearningInjected: 0,
+    agentLearningRecallHits: 0,
   },
 };
 

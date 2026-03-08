@@ -249,3 +249,67 @@ export function isOversizedAtomicMemory(text: string): boolean {
   const lines = normalized.split(/\r?\n/).filter((line) => line.trim().length > 0);
   return normalized.length > 1600 || lines.length > 18;
 }
+
+const RECAP_PREFIXES = [
+  /^the user\b/i,
+  /^user\b/i,
+  /^usuario\b/i,
+  /^in this (?:turn|conversation)\b/i,
+  /^(?:we|i) (?:discussed|talked about|went over|covered)\b/i,
+  /^(?:summary|recap)\b/i,
+];
+
+const TEMPORAL_REFERENCE_PATTERN =
+  /\b(?:today|tomorrow|yesterday|this turn|this session|earlier in this session|just now|in this chat)\b/i;
+
+export function isLikelyTurnRecap(text: string): boolean {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.length > 260 && /\b(?:asked|wanted|needed|said|requested)\b/i.test(normalized)) {
+    return true;
+  }
+  return RECAP_PREFIXES.some((pattern) => pattern.test(normalized));
+}
+
+function splitIntoSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => normalizeWhitespace(sentence))
+    .filter(Boolean);
+}
+
+function looksReusableLearning(text: string): boolean {
+  if (text.length < 24 || text.length > 220) {
+    return false;
+  }
+  if (TEMPORAL_REFERENCE_PATTERN.test(text)) {
+    return false;
+  }
+  if (isLikelyTranscriptLikeText(text) || isLikelyTurnRecap(text)) {
+    return false;
+  }
+  return /\b(?:prefer|avoid|use|keep|store|remember|dedupe|inject|search|persist|reject|limit|filter|only|always|never|when)\b/i.test(
+    text,
+  );
+}
+
+export function compactAgentLearning(text: string): string | undefined {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized || isOversizedAtomicMemory(normalized) || isLikelyTranscriptLikeText(normalized)) {
+    return undefined;
+  }
+  if (looksReusableLearning(normalized)) {
+    return normalized;
+  }
+
+  const sentences = splitIntoSentences(normalized);
+  for (const sentence of sentences) {
+    if (looksReusableLearning(sentence)) {
+      return sentence;
+    }
+  }
+
+  return undefined;
+}

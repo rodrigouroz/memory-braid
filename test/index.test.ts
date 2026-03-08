@@ -94,13 +94,44 @@ function createApi(params?: {
   return { api, tools, hooks, services, commands };
 }
 
+function getBoundTools(
+  tools: Array<{ factory: unknown; options?: unknown }>,
+  ctx: Record<string, unknown>,
+) {
+  const out: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  for (const entry of tools) {
+    const factory = entry.factory;
+    if (typeof factory === "function") {
+      const value = factory(ctx);
+      if (Array.isArray(value)) {
+        out.push(...value);
+      } else if (value) {
+        out.push(value);
+      }
+      continue;
+    }
+    if (factory && typeof factory === "object") {
+      out.push(factory as { name: string; execute: (...args: unknown[]) => Promise<unknown> });
+    }
+  }
+  return out;
+}
+
 describe("memory-braid plugin", () => {
   it("registers tools, hooks, and service", async () => {
     const { api, tools, hooks, services, commands } = createApi();
 
     await plugin.register(api as never);
 
-    expect(tools).toHaveLength(1);
+    const boundTools = getBoundTools(tools, {
+      config: api.config,
+      workspaceDir: "/tmp",
+      agentId: "main",
+      sessionKey: "s1",
+    });
+    expect(boundTools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["memory_search", "memory_get", "remember_learning"]),
+    );
     expect(hooks.map((item) => item.name)).toEqual(
       expect.arrayContaining(["before_agent_start", "before_message_write", "agent_end"]),
     );
@@ -200,7 +231,12 @@ describe("memory-braid plugin", () => {
     expect(addSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         text: "Remember that I prefer black coffee in the morning.",
+        scope: {
+          workspaceHash: expect.any(String),
+          agentId: "main",
+        },
         metadata: expect.objectContaining({
+          memoryOwner: "user",
           captureOrigin: "external_user",
           capturePath: "before_message_write",
         }),
@@ -217,6 +253,9 @@ describe("memory-braid plugin", () => {
       pluginConfig: {
         capture: {
           includeAssistant: true,
+          assistant: {
+            minUtilityScore: 0.6,
+          },
         },
       },
     });
@@ -253,7 +292,8 @@ describe("memory-braid plugin", () => {
           },
           {
             role: "assistant",
-            content: "Remember that we decided to deploy every Friday afternoon.",
+            content:
+              "Remember that we decided we will use Friday afternoon deploys and keep that strategy for release planning.",
           },
         ],
       },
@@ -267,12 +307,87 @@ describe("memory-braid plugin", () => {
     expect(addSpy).toHaveBeenCalledTimes(1);
     expect(addSpy).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: "Remember that we decided to deploy every Friday afternoon.",
+        text: expect.stringContaining("Friday afternoon deploys"),
         metadata: expect.objectContaining({
+          sourceType: "agent_learning",
+          memoryOwner: "agent",
           captureOrigin: "assistant_derived",
         }),
       }),
     );
+  });
+
+  it("persists remember_learning in workspace scope with agent metadata", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "learn-1" });
+    vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
+    const { api, tools } = createApi({ stateDir: path.join(tempDir, "state") });
+
+    await plugin.register(api as never);
+    const boundTools = getBoundTools(tools, {
+      config: api.config,
+      workspaceDir: path.join(tempDir, "workspace"),
+      agentId: "main",
+      sessionKey: "s1",
+    });
+    const tool = boundTools.find((entry) => entry.name === "remember_learning");
+    expect(tool).toBeTruthy();
+
+    const result = (await tool!.execute("call-1", {
+      text: "Prefer strict lexical gating before semantic dedupe to avoid unnecessary Mem0 similarity calls.",
+      kind: "heuristic",
+      recallTarget: "planning",
+    })) as { details?: Record<string, unknown> };
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: {
+          workspaceHash: expect.any(String),
+          agentId: "main",
+        },
+        metadata: expect.objectContaining({
+          sourceType: "agent_learning",
+          memoryOwner: "agent",
+          memoryKind: "heuristic",
+          captureIntent: "explicit_tool",
+          recallTarget: "planning",
+          sessionKey: "s1",
+        }),
+      }),
+    );
+    expect(result.details).toMatchObject({
+      accepted: true,
+      memoryId: "learn-1",
+    });
+  });
+
+  it("rejects oversized remember_learning payloads", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "learn-1" });
+    vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
+    const { api, tools } = createApi({ stateDir: path.join(tempDir, "state") });
+
+    await plugin.register(api as never);
+    const boundTools = getBoundTools(tools, {
+      config: api.config,
+      workspaceDir: path.join(tempDir, "workspace"),
+      agentId: "main",
+      sessionKey: "s1",
+    });
+    const tool = boundTools.find((entry) => entry.name === "remember_learning");
+    const longText = "Avoid expensive duplicate similarity scans. ".repeat(80);
+
+    const result = (await tool!.execute("call-1", {
+      text: longText,
+      kind: "lesson",
+    })) as { details?: Record<string, unknown> };
+
+    expect(addSpy).toHaveBeenCalledTimes(0);
+    expect(result.details).toMatchObject({
+      accepted: false,
+      reason: "oversized",
+    });
   });
 
   it("falls back to the last user turn and ignores earlier history and tool results", async () => {
@@ -478,9 +593,7 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const factory = tools[0]?.factory as ((ctx: unknown) => Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }>) | undefined;
-    expect(factory).toBeTypeOf("function");
-    const boundTools = factory!({
+    const boundTools = getBoundTools(tools, {
       config: api.config,
       workspaceDir: "/tmp",
       agentId: "main",
@@ -493,7 +606,7 @@ describe("memory-braid plugin", () => {
     const details = (output as { details?: { results?: Array<{ snippet?: string }> } }).details;
     const snippets = (details?.results ?? []).map((entry) => entry.snippet);
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(2);
     expect(snippets[0]).toContain("Recent memory");
   });
 
@@ -546,7 +659,7 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(2);
     expect(result && "prependContext" in result ? result.prependContext : "").toContain(
       "relevance gating",
     );
@@ -555,6 +668,174 @@ describe("memory-braid plugin", () => {
     );
     expect(result && "prependContext" in result ? result.prependContext : "").not.toContain(
       "reembolso",
+    );
+  });
+
+  it("injects separated user memories and agent learnings with stable system prompt", async () => {
+    const searchSpy = vi
+      .spyOn(Mem0Adapter.prototype, "searchMemories")
+      .mockResolvedValueOnce([
+        {
+          source: "mem0",
+          snippet: "Prefers afternoon standups for planning.",
+          score: 0.88,
+          metadata: {
+            memoryOwner: "user",
+            memoryKind: "preference",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+        {
+          source: "mem0",
+          snippet: "Prefer strict relevance gating before injecting agent learnings into planning context.",
+          score: 0.92,
+          metadata: {
+            memoryOwner: "agent",
+            memoryKind: "heuristic",
+            recallTarget: "planning",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          source: "mem0",
+          snippet: "Prefers afternoon standups for planning.",
+          score: 0.88,
+          metadata: {
+            memoryOwner: "user",
+            memoryKind: "preference",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+        {
+          source: "mem0",
+          snippet: "Prefer strict relevance gating before injecting agent learnings into planning context.",
+          score: 0.92,
+          metadata: {
+            memoryOwner: "agent",
+            memoryKind: "heuristic",
+            recallTarget: "planning",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string; systemPrompt?: string } | void>)
+      | undefined;
+
+    const first = await beforeAgentStart!(
+      {
+        prompt: "Help me with planning standups and reduce noisy learnings",
+        messages: [
+          { role: "user", content: "Help me with planning standups and reduce noisy learnings" },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+    const second = await beforeAgentStart!(
+      {
+        prompt: "Help me with planning standups and reduce noisy learnings",
+        messages: [
+          { role: "user", content: "Help me with planning standups and reduce noisy learnings" },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s2",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(4);
+    expect(first && "systemPrompt" in first ? first.systemPrompt : "").toContain(
+      "remember_learning",
+    );
+    expect(first && "systemPrompt" in first ? first.systemPrompt : "").toBe(
+      second && "systemPrompt" in second ? second.systemPrompt : "",
+    );
+    expect(first && "prependContext" in first ? first.prependContext : "").toContain(
+      "<user-memories>",
+    );
+    expect(first && "prependContext" in first ? first.prependContext : "").toContain(
+      "<agent-learnings>",
+    );
+  });
+
+  it("falls back to legacy session-scoped mem0 recall without migration", async () => {
+    const searchSpy = vi
+      .spyOn(Mem0Adapter.prototype, "searchMemories")
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          source: "mem0",
+          snippet: "Prefers black coffee in the morning.",
+          score: 0.86,
+          metadata: {
+            captureOrigin: "external_user",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+      ]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+    const result = await beforeAgentStart!(
+      {
+        prompt: "I need the black coffee preference from memory.",
+        messages: [{ role: "user", content: "I need the black coffee preference from memory." }],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "legacy-session",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(searchSpy.mock.calls[0]?.[0]).toMatchObject({
+      scope: {
+        workspaceHash: expect.any(String),
+        agentId: "main",
+      },
+    });
+    expect(searchSpy.mock.calls[1]?.[0]).toMatchObject({
+      scope: {
+        workspaceHash: expect.any(String),
+        agentId: "main",
+        sessionKey: "legacy-session",
+      },
+    });
+    expect(result && "prependContext" in result ? result.prependContext : "").toContain(
+      "black coffee",
     );
   });
 
@@ -595,8 +876,11 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
-    expect(result).toBeUndefined();
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(result && "prependContext" in result ? result.prependContext : undefined).toBeUndefined();
+    expect(result && "systemPrompt" in result ? result.systemPrompt : "").toContain(
+      "remember_learning",
+    );
   });
 
   it("skips recall when there is no new user turn in the same session", async () => {
@@ -661,7 +945,7 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(2);
   });
 
   it("skips recall for excluded cron/subagent/acp sessions", async () => {
@@ -760,11 +1044,7 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const factory = tools[0]?.factory as
-      | ((ctx: unknown) => Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }>)
-      | undefined;
-    expect(factory).toBeTypeOf("function");
-    const boundTools = factory!({
+    const boundTools = getBoundTools(tools, {
       config: api.config,
       workspaceDir: "/tmp",
       agentId: "main",
@@ -779,7 +1059,7 @@ describe("memory-braid plugin", () => {
     const details = (output as { details?: { results?: Array<{ snippet?: string }> } }).details;
     const snippets = (details?.results ?? []).map((entry) => entry.snippet ?? "");
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(2);
     expect(snippets[0]).toContain("afternoon standups");
   });
 
@@ -886,11 +1166,7 @@ describe("memory-braid plugin", () => {
     expect(lifecycle.entries["m-1"]).toBeTruthy();
     expect(lifecycle.entries["m-1"]?.recallCount).toBe(0);
 
-    const factory = tools[0]?.factory as
-      | ((ctx: unknown) => Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }>)
-      | undefined;
-    expect(factory).toBeTypeOf("function");
-    const boundTools = factory!({
+    const boundTools = getBoundTools(tools, {
       config: api.config,
       workspaceDir,
       agentId: "main",
@@ -902,7 +1178,7 @@ describe("memory-braid plugin", () => {
     await searchTool!.execute("call-1", { query: "standups" });
 
     expect(addSpy).toHaveBeenCalledTimes(1);
-    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(2);
     lifecycle = await readLifecycleState(createStatePaths(stateDir));
     expect(lifecycle.entries["m-1"]?.recallCount).toBe(1);
     expect(lifecycle.entries["m-1"]?.lastRecalledAt).toBeTypeOf("number");
@@ -967,6 +1243,97 @@ describe("memory-braid plugin", () => {
     );
 
     expect(addSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("limits assistant-derived agent learnings with cooldown and max writes", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
+    const { api, hooks } = createApi({
+      stateDir,
+      pluginConfig: {
+        capture: {
+          includeAssistant: true,
+          assistant: {
+            autoCapture: true,
+            minUtilityScore: 0.4,
+            cooldownMinutes: 30,
+            maxWritesPerSessionWindow: 1,
+            maxItemsPerRun: 1,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeWrite = hooks.find((entry) => entry.name === "before_message_write")?.handler as
+      | ((event: unknown) => Promise<void>)
+      | undefined;
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [{ type: "text", text: "first short note" }],
+      },
+    });
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "first short note" },
+          {
+            role: "assistant",
+            content:
+              "Remember that I prefer strict lexical overlap gating before semantic dedupe to reduce redundant similarity calls.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [{ type: "text", text: "second short note" }],
+      },
+    });
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "second short note" },
+          {
+            role: "assistant",
+            content:
+              "Remember that I prefer strict lexical overlap gating before semantic dedupe to reduce redundant similarity calls.",
+          },
+        ],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    const stats = await readStatsState(createStatePaths(stateDir));
+    expect(stats.capture.agentLearningAutoCaptured).toBe(1);
+    expect(stats.capture.agentLearningRejectedCooldown).toBe(1);
   });
 
   it("skips capture for excluded cron/subagent/acp sessions", async () => {
@@ -1188,8 +1555,8 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    expect(searchSpy).toHaveBeenCalledTimes(1);
-    expect(result).toBeUndefined();
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(result && "prependContext" in result ? result.prependContext : undefined).toBeUndefined();
   });
 
   it("purges only plugin-captured memories during remediation delete", async () => {

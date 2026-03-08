@@ -5,6 +5,10 @@ describe("parseConfig", () => {
   it("defaults capture to user-only extraction", () => {
     const cfg = parseConfig({});
     expect(cfg.capture.includeAssistant).toBe(false);
+    expect(cfg.capture.assistant.autoCapture).toBe(false);
+    expect(cfg.capture.assistant.explicitTool).toBe(true);
+    expect(cfg.recall.user.injectTopK).toBe(5);
+    expect(cfg.recall.agent.injectTopK).toBe(2);
     expect(cfg.timeDecay.enabled).toBe(false);
     expect(cfg.lifecycle.enabled).toBe(false);
     expect(cfg.lifecycle.captureTtlDays).toBe(90);
@@ -67,6 +71,7 @@ describe("parseConfig", () => {
 
     expect(cfg.capture.mode).toBe("ml");
     expect(cfg.capture.includeAssistant).toBe(true);
+    expect(cfg.capture.assistant.autoCapture).toBe(true);
     expect(cfg.capture.maxItemsPerRun).toBe(12);
     expect(cfg.timeDecay.enabled).toBe(true);
     expect(cfg.lifecycle.enabled).toBe(true);
@@ -103,5 +108,45 @@ describe("parseConfig", () => {
 
     expect(cfg.entityExtraction.provider).toBe("openai");
     expect(cfg.entityExtraction.model).toBe("gpt-4o-mini");
+  });
+
+  it("supports separated recall and assistant capture config", () => {
+    const cfg = parseConfig({
+      recall: {
+        injectTopK: 4,
+        user: {
+          injectTopK: 3,
+        },
+        agent: {
+          injectTopK: 1,
+          minScore: 0.9,
+          onlyPlanning: false,
+        },
+      },
+      capture: {
+        assistant: {
+          autoCapture: true,
+          explicitTool: false,
+          maxItemsPerRun: 1,
+          minUtilityScore: 0.91,
+          minNoveltyScore: 0.93,
+          maxWritesPerSessionWindow: 2,
+          cooldownMinutes: 9,
+        },
+      },
+    });
+
+    expect(cfg.recall.injectTopK).toBe(4);
+    expect(cfg.recall.user.injectTopK).toBe(3);
+    expect(cfg.recall.agent.injectTopK).toBe(1);
+    expect(cfg.recall.agent.minScore).toBe(0.9);
+    expect(cfg.recall.agent.onlyPlanning).toBe(false);
+    expect(cfg.capture.assistant.autoCapture).toBe(true);
+    expect(cfg.capture.assistant.explicitTool).toBe(false);
+    expect(cfg.capture.assistant.maxItemsPerRun).toBe(1);
+    expect(cfg.capture.assistant.minUtilityScore).toBe(0.91);
+    expect(cfg.capture.assistant.minNoveltyScore).toBe(0.93);
+    expect(cfg.capture.assistant.maxWritesPerSessionWindow).toBe(2);
+    expect(cfg.capture.assistant.cooldownMinutes).toBe(9);
   });
 });

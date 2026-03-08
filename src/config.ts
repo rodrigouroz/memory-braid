@@ -11,6 +11,16 @@ export type MemoryBraidConfig = {
   recall: {
     maxResults: number;
     injectTopK: number;
+    user: {
+      enabled: boolean;
+      injectTopK: number;
+    };
+    agent: {
+      enabled: boolean;
+      injectTopK: number;
+      minScore: number;
+      onlyPlanning: boolean;
+    };
     merge: {
       strategy: "rrf";
       rrfK: number;
@@ -23,6 +33,16 @@ export type MemoryBraidConfig = {
     mode: "local" | "hybrid" | "ml";
     includeAssistant: boolean;
     maxItemsPerRun: number;
+    assistant: {
+      enabled: boolean;
+      autoCapture: boolean;
+      explicitTool: boolean;
+      maxItemsPerRun: number;
+      minUtilityScore: number;
+      minNoveltyScore: number;
+      maxWritesPerSessionWindow: number;
+      cooldownMinutes: number;
+    };
     ml: {
       provider?: "openai" | "anthropic" | "gemini";
       model?: string;
@@ -80,6 +100,16 @@ const DEFAULTS: MemoryBraidConfig = {
   recall: {
     maxResults: 8,
     injectTopK: 5,
+    user: {
+      enabled: true,
+      injectTopK: 5,
+    },
+    agent: {
+      enabled: true,
+      injectTopK: 2,
+      minScore: 0.78,
+      onlyPlanning: true,
+    },
     merge: {
       strategy: "rrf",
       rrfK: 60,
@@ -92,6 +122,16 @@ const DEFAULTS: MemoryBraidConfig = {
     mode: "local",
     includeAssistant: false,
     maxItemsPerRun: 6,
+    assistant: {
+      enabled: true,
+      autoCapture: false,
+      explicitTool: true,
+      maxItemsPerRun: 2,
+      minUtilityScore: 0.8,
+      minNoveltyScore: 0.85,
+      maxWritesPerSessionWindow: 3,
+      cooldownMinutes: 5,
+    },
     ml: {
       provider: undefined,
       model: undefined,
@@ -168,8 +208,11 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const root = asRecord(raw);
   const mem0 = asRecord(root.mem0);
   const recall = asRecord(root.recall);
+  const recallUser = asRecord(recall.user);
+  const recallAgent = asRecord(recall.agent);
   const merge = asRecord(recall.merge);
   const capture = asRecord(root.capture);
+  const captureAssistant = asRecord(capture.assistant);
   const entityExtraction = asRecord(root.entityExtraction);
   const entityStartup = asRecord(entityExtraction.startup);
   const ml = asRecord(capture.ml);
@@ -194,6 +237,16 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
         ? parsedEntityModel
         : "gpt-4o-mini"
       : parsedEntityModel ?? DEFAULTS.entityExtraction.model;
+  const includeAssistant = asBoolean(
+    capture.includeAssistant,
+    DEFAULTS.capture.includeAssistant,
+  );
+  const legacyInjectTopK = asInt(
+    recall.injectTopK,
+    DEFAULTS.recall.injectTopK,
+    1,
+    20,
+  );
 
   return {
     enabled: asBoolean(root.enabled, DEFAULTS.enabled),
@@ -207,7 +260,35 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     },
     recall: {
       maxResults: asInt(recall.maxResults, DEFAULTS.recall.maxResults, 1, 50),
-      injectTopK: asInt(recall.injectTopK, DEFAULTS.recall.injectTopK, 1, 20),
+      injectTopK: legacyInjectTopK,
+      user: {
+        enabled: asBoolean(recallUser.enabled, DEFAULTS.recall.user.enabled),
+        injectTopK: asInt(
+          recallUser.injectTopK,
+          legacyInjectTopK,
+          1,
+          20,
+        ),
+      },
+      agent: {
+        enabled: asBoolean(recallAgent.enabled, DEFAULTS.recall.agent.enabled),
+        injectTopK: asInt(
+          recallAgent.injectTopK,
+          DEFAULTS.recall.agent.injectTopK,
+          1,
+          20,
+        ),
+        minScore: asNumber(
+          recallAgent.minScore,
+          DEFAULTS.recall.agent.minScore,
+          0,
+          1,
+        ),
+        onlyPlanning: asBoolean(
+          recallAgent.onlyPlanning,
+          DEFAULTS.recall.agent.onlyPlanning,
+        ),
+      },
       merge: {
         strategy: "rrf",
         rrfK: asInt(merge.rrfK, DEFAULTS.recall.merge.rrfK, 1, 500),
@@ -218,8 +299,52 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
     capture: {
       enabled: asBoolean(capture.enabled, DEFAULTS.capture.enabled),
       mode: captureMode,
-      includeAssistant: asBoolean(capture.includeAssistant, DEFAULTS.capture.includeAssistant),
+      includeAssistant,
       maxItemsPerRun: asInt(capture.maxItemsPerRun, DEFAULTS.capture.maxItemsPerRun, 1, 50),
+      assistant: {
+        enabled: asBoolean(
+          captureAssistant.enabled,
+          DEFAULTS.capture.assistant.enabled,
+        ),
+        autoCapture: asBoolean(
+          captureAssistant.autoCapture,
+          includeAssistant,
+        ),
+        explicitTool: asBoolean(
+          captureAssistant.explicitTool,
+          DEFAULTS.capture.assistant.explicitTool,
+        ),
+        maxItemsPerRun: asInt(
+          captureAssistant.maxItemsPerRun,
+          DEFAULTS.capture.assistant.maxItemsPerRun,
+          1,
+          10,
+        ),
+        minUtilityScore: asNumber(
+          captureAssistant.minUtilityScore,
+          DEFAULTS.capture.assistant.minUtilityScore,
+          0,
+          1,
+        ),
+        minNoveltyScore: asNumber(
+          captureAssistant.minNoveltyScore,
+          DEFAULTS.capture.assistant.minNoveltyScore,
+          0,
+          1,
+        ),
+        maxWritesPerSessionWindow: asInt(
+          captureAssistant.maxWritesPerSessionWindow,
+          DEFAULTS.capture.assistant.maxWritesPerSessionWindow,
+          1,
+          20,
+        ),
+        cooldownMinutes: asInt(
+          captureAssistant.cooldownMinutes,
+          DEFAULTS.capture.assistant.cooldownMinutes,
+          0,
+          240,
+        ),
+      },
       ml: {
         provider:
           ml.provider === "openai" || ml.provider === "anthropic" || ml.provider === "gemini"

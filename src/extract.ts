@@ -432,7 +432,7 @@ export async function extractCandidates(params: {
   runId?: string;
 }): Promise<ExtractedCandidate[]> {
   const normalized = normalizeMessages(params.messages);
-  const captureFromAssistant = params.cfg.capture.includeAssistant;
+  const captureFromAssistant = params.cfg.capture.assistant.autoCapture;
   const candidatesInput = normalized.filter((message) =>
     captureFromAssistant
       ? message.role === "user" || message.role === "assistant"

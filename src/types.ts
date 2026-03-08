@@ -6,6 +6,24 @@ export type CaptureOrigin = "external_user" | "assistant_derived";
 
 export type CapturePath = "before_message_write" | "agent_end_last_turn";
 
+export type MemoryOwner = "user" | "agent";
+
+export type MemoryKind =
+  | "fact"
+  | "preference"
+  | "decision"
+  | "task"
+  | "heuristic"
+  | "lesson"
+  | "strategy"
+  | "other";
+
+export type CaptureIntent = "observed" | "inferred" | "self_reflection" | "explicit_tool";
+
+export type RecallTarget = "response" | "planning" | "both";
+
+export type Stability = "ephemeral" | "session" | "durable";
+
 export type ScopeKey = {
   workspaceHash: string;
   agentId: string;
@@ -75,6 +93,15 @@ export type CaptureStats = {
   quarantinedFiltered: number;
   remediationQuarantined: number;
   remediationDeleted: number;
+  agentLearningToolCalls: number;
+  agentLearningAccepted: number;
+  agentLearningRejectedValidation: number;
+  agentLearningRejectedNovelty: number;
+  agentLearningRejectedCooldown: number;
+  agentLearningAutoCaptured: number;
+  agentLearningAutoRejected: number;
+  agentLearningInjected: number;
+  agentLearningRecallHits: number;
   lastRunAt?: string;
   lastRemediationAt?: string;
 };

@@ -488,7 +488,17 @@ Use this preset when:
     "memory-braid": {
       "recall": {
         "maxResults": 8,
-        "injectTopK": 5,
+        "injectTopK": 4,
+        "user": {
+          "enabled": true,
+          "injectTopK": 4
+        },
+        "agent": {
+          "enabled": true,
+          "injectTopK": 2,
+          "minScore": 0.78,
+          "onlyPlanning": true
+        },
         "merge": {
           "rrfK": 60,
           "localWeight": 1,
@@ -500,6 +510,16 @@ Use this preset when:
         "mode": "hybrid",
         "includeAssistant": false,
         "maxItemsPerRun": 6,
+        "assistant": {
+          "enabled": true,
+          "autoCapture": false,
+          "explicitTool": true,
+          "maxItemsPerRun": 2,
+          "minUtilityScore": 0.8,
+          "minNoveltyScore": 0.85,
+          "maxWritesPerSessionWindow": 3,
+          "cooldownMinutes": 5
+        },
         "ml": {
           "provider": "openai",
           "model": "gpt-4o-mini",
@@ -548,8 +568,20 @@ Capture defaults are:
 
 - `capture.enabled`: `true`
 - `capture.mode`: `"local"`
-- `capture.includeAssistant`: `false` (default user-only capture)
+- `capture.includeAssistant`: `false` (legacy alias for `capture.assistant.autoCapture`)
 - `capture.maxItemsPerRun`: `6`
+- `capture.assistant.enabled`: `true`
+- `capture.assistant.autoCapture`: `false`
+- `capture.assistant.explicitTool`: `true`
+- `capture.assistant.maxItemsPerRun`: `2`
+- `capture.assistant.minUtilityScore`: `0.8`
+- `capture.assistant.minNoveltyScore`: `0.85`
+- `capture.assistant.maxWritesPerSessionWindow`: `3`
+- `capture.assistant.cooldownMinutes`: `5`
+- `recall.user.injectTopK`: `5` (legacy `recall.injectTopK` still works)
+- `recall.agent.injectTopK`: `2`
+- `recall.agent.minScore`: `0.78`
+- `recall.agent.onlyPlanning`: `true`
 - `capture.ml.provider`: unset
 - `capture.ml.model`: unset
 - `capture.ml.timeoutMs`: `2500`
@@ -564,13 +596,38 @@ Important behavior:
 - `capture.mode = "local"`: heuristic-only extraction.
 - `capture.mode = "hybrid"`: heuristic extraction + ML enrichment when ML config is set.
 - `capture.mode = "ml"`: ML-first extraction; falls back to heuristic if ML config/call is unavailable.
-- `capture.includeAssistant = false` (default): only `user` messages are considered for capture.
-- `capture.includeAssistant = true`: both `user` and `assistant` messages are considered for capture.
+- New memories are persisted by `workspace + agent`, not by session. `sessionKey` is kept only as metadata and for assistant-learning cooldown/window logic.
+- Recall still performs a legacy dual-read fallback for older session-scoped Mem0 records, without rewriting them.
+- `capture.includeAssistant = false` (default): assistant auto-capture is off.
+- `capture.includeAssistant = true` or `capture.assistant.autoCapture = true`: assistant messages are eligible for strict agent-learning auto-capture.
+- `capture.assistant.explicitTool = true`: exposes the `remember_learning` tool.
+- `recall.user.*` controls injected user memories.
+- `recall.agent.*` controls injected agent learnings.
 - ML calls run only when both `capture.ml.provider` and `capture.ml.model` are set.
 - `timeDecay.enabled = true`: applies temporal decay to Mem0 results using Memory Core's `agents.*.memorySearch.query.hybrid.temporalDecay` settings.
 - If Memory Core temporal decay is disabled, Mem0 decay is skipped even when `timeDecay.enabled = true`.
 - `lifecycle.enabled = true`: tracks captured Mem0 IDs, applies TTL cleanup, and exposes `/memorybraid cleanup`.
 - `lifecycle.reinforceOnRecall = true`: successful recalls refresh lifecycle timestamps, extending TTL survival for frequently used memories.
+
+## Agent learnings
+
+Memory Braid v2 adds explicit and implicit agent learnings.
+
+- `remember_learning` stores compact reusable heuristics, lessons, and strategies for future runs.
+- Use it for operational guidance that helps the agent avoid repeated mistakes or reduce tool cost/noise.
+- Do not use it for long summaries, transient details, or raw reasoning.
+- Assistant auto-capture is still available, but it is stricter than user-memory capture and only persists compact learnings that pass utility, novelty, and cooldown checks.
+
+Recall is now split into two dynamic blocks:
+
+- `<user-memories>`: user facts, preferences, decisions, and tasks.
+- `<agent-learnings>`: reusable agent heuristics, lessons, and strategies.
+
+Cache safety:
+
+- Tool awareness for `remember_learning` is injected through a stable `systemPrompt`.
+- Retrieved memories stay in dynamic `prependContext`, not in the stable prompt body.
+- Agent learnings use low `top-k`, high relevance thresholds, and deterministic formatting to avoid unnecessary prompt churn.
 
 ## Entity extraction defaults
 
