@@ -183,6 +183,26 @@ function resolveLatestUserTurnSignature(messages?: unknown[]): string | undefine
   return undefined;
 }
 
+function resolveLatestUserTurnText(messages?: unknown[]): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return undefined;
+  }
+
+  const normalized = normalizeHookMessages(messages);
+  for (let i = normalized.length - 1; i >= 0; i -= 1) {
+    const message = normalized[i];
+    if (!message || message.role !== "user") {
+      continue;
+    }
+    const text = normalizeWhitespace(message.text);
+    if (!text) {
+      continue;
+    }
+    return text;
+  }
+  return undefined;
+}
+
 function resolvePromptTurnSignature(prompt: string): string | undefined {
   const normalized = normalizeForHash(prompt);
   if (!normalized) {
@@ -2248,7 +2268,8 @@ const memoryBraidPlugin = {
         return baseResult;
       }
 
-      const recallQuery = sanitizeRecallQuery(event.prompt);
+      const latestUserTurnText = resolveLatestUserTurnText(event.messages);
+      const recallQuery = sanitizeRecallQuery(latestUserTurnText ?? event.prompt);
       if (!recallQuery) {
         return baseResult;
       }

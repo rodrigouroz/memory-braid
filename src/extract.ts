@@ -1,6 +1,10 @@
 import { normalizeForHash, normalizeWhitespace, sha256 } from "./chunking.js";
 import type { MemoryBraidConfig } from "./config.js";
-import { isLikelyTranscriptLikeText, isOversizedAtomicMemory } from "./capture.js";
+import {
+  extractStructuredTextFromString,
+  isLikelyTranscriptLikeText,
+  isOversizedAtomicMemory,
+} from "./capture.js";
 import { MemoryBraidLogger } from "./logger.js";
 import type { ExtractedCandidate } from "./types.js";
 
@@ -47,7 +51,7 @@ function isLikelyFeedOrImportedText(text: string): boolean {
 
 function extractMessageText(content: unknown): string {
   if (typeof content === "string") {
-    return normalizeWhitespace(content);
+    return extractStructuredTextFromString(content) ?? normalizeWhitespace(content);
   }
   if (!Array.isArray(content)) {
     return "";
@@ -59,7 +63,8 @@ function extractMessageText(content: unknown): string {
     }
     const item = block as { type?: unknown; text?: unknown };
     if (item.type === "text" && typeof item.text === "string") {
-      const normalized = normalizeWhitespace(item.text);
+      const normalized =
+        extractStructuredTextFromString(item.text) ?? normalizeWhitespace(item.text);
       if (normalized) {
         parts.push(normalized);
       }

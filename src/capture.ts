@@ -17,9 +17,70 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function extractStructuredTextCandidate(value: unknown, depth = 0): string {
+  if (depth > 5) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return normalizeWhitespace(value);
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => extractStructuredTextCandidate(entry, depth + 1))
+      .filter(Boolean);
+    return normalizeWhitespace(parts.join(" "));
+  }
+
+  const record = value as Record<string, unknown>;
+  const directText = typeof record.text === "string" ? normalizeWhitespace(record.text) : "";
+  if (directText) {
+    return directText;
+  }
+  const caption = typeof record.caption === "string" ? normalizeWhitespace(record.caption) : "";
+  if (caption) {
+    return caption;
+  }
+
+  const nestedCandidates = [
+    record.message,
+    record.data,
+    record.payload,
+    record.update,
+    record.edited_message,
+    record.channel_post,
+    record.callback_query,
+  ];
+  for (const candidate of nestedCandidates) {
+    const extracted = extractStructuredTextCandidate(candidate, depth + 1);
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  return "";
+}
+
+export function extractStructuredTextFromString(content: string): string | undefined {
+  const normalized = normalizeWhitespace(content);
+  if (!normalized || !/^[{\[]/.test(normalized)) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    const extracted = extractStructuredTextCandidate(parsed);
+    return extracted || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function extractHookMessageText(content: unknown): string {
   if (typeof content === "string") {
-    return normalizeWhitespace(content);
+    return extractStructuredTextFromString(content) ?? normalizeWhitespace(content);
   }
   if (!Array.isArray(content)) {
     return "";
@@ -32,7 +93,8 @@ export function extractHookMessageText(content: unknown): string {
     }
     const item = block as { type?: unknown; text?: unknown };
     if (item.type === "text" && typeof item.text === "string") {
-      const normalized = normalizeWhitespace(item.text);
+      const normalized =
+        extractStructuredTextFromString(item.text) ?? normalizeWhitespace(item.text);
       if (normalized) {
         parts.push(normalized);
       }

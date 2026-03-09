@@ -839,6 +839,69 @@ describe("memory-braid plugin", () => {
     );
   });
 
+  it("uses the latest normalized user turn as the recall query before falling back to prompt", async () => {
+    const searchSpy = vi
+      .spyOn(Mem0Adapter.prototype, "searchMemories")
+      .mockResolvedValueOnce([
+        {
+          source: "mem0",
+          snippet: "User prefers black coffee in the morning.",
+          score: 0.9,
+          metadata: {
+            memoryOwner: "user",
+            memoryKind: "preference",
+            indexedAt: "2026-02-25T12:00:00.000Z",
+          },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+
+    const result = await beforeAgentStart!(
+      {
+        prompt:
+          "telegram envelope username rodrigonu date 1700000000 black coffee preference from a broader prompt wrapper",
+        messages: [
+          {
+            role: "user",
+            content: JSON.stringify({
+              message_id: 123,
+              date: 1700000000,
+              chat: { id: 999, username: "rodrigonu" },
+              text: "Remember that I prefer black coffee in the morning.",
+            }),
+          },
+        ],
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(searchSpy.mock.calls[0]?.[0]).toMatchObject({
+      query: "Remember that I prefer black coffee in the morning.",
+    });
+    expect(result && "prependContext" in result ? result.prependContext : "").toContain(
+      "black coffee",
+    );
+  });
+
   it("injects only mem0 recall and ignores local-only matches", async () => {
     const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
     const { api, hooks } = createApi({

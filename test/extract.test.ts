@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { extractHookMessageText } from "../src/capture.js";
 import { parseConfig } from "../src/config.js";
 import { extractCandidates } from "../src/extract.js";
 import { MemoryBraidLogger } from "../src/logger.js";
@@ -126,5 +127,42 @@ describe("extractCandidates role filtering", () => {
     expect(candidates).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
+  });
+
+  it("extracts only the text field from structured telegram-style payload strings", async () => {
+    const payload = JSON.stringify({
+      message_id: 123,
+      date: 1700000000,
+      chat: {
+        id: 999,
+        username: "rodrigonu",
+      },
+      text: "Remember that I prefer black coffee in the morning.",
+    });
+
+    expect(extractHookMessageText(payload)).toBe(
+      "Remember that I prefer black coffee in the morning.",
+    );
+
+    const cfg = parseConfig({
+      capture: {
+        mode: "local",
+      },
+    });
+    const log = new MemoryBraidLogger(noopLogger, cfg.debug);
+    const candidates = await extractCandidates({
+      messages: [
+        {
+          role: "user",
+          content: payload,
+        },
+      ],
+      cfg,
+      log,
+    });
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.text).toBe("Remember that I prefer black coffee in the morning.");
+    expect(candidates[0]?.text).not.toContain("rodrigonu");
   });
 });
