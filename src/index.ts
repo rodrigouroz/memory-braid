@@ -11,11 +11,25 @@ import {
   normalizeHookMessages,
 } from "./capture.js";
 import { parseConfig, pluginConfigSchema } from "./config.js";
+import {
+  buildConsolidationDrafts,
+  findSupersededSemanticMemories,
+} from "./consolidation.js";
 import { stagedDedupe } from "./dedupe.js";
 import { EntityExtractionManager } from "./entities.js";
 import { extractCandidates } from "./extract.js";
 import { MemoryBraidLogger } from "./logger.js";
 import { resolveLocalTools, runLocalGet, runLocalSearch } from "./local-memory.js";
+import {
+  buildTaxonomy,
+  formatTaxonomySummary,
+  inferMemoryLayer as inferNormalizedMemoryLayer,
+  normalizeTaxonomy,
+} from "./memory-model.js";
+import {
+  scoreObservedMemory,
+  scoreProceduralMemory,
+} from "./memory-selection.js";
 import { Mem0Adapter } from "./mem0-client.js";
 import { mergeWithRrf } from "./merge.js";
 import {
@@ -36,20 +50,32 @@ import {
   createStatePaths,
   ensureStateDir,
   readCaptureDedupeState,
+  readConsolidationState,
   readLifecycleState,
   readRemediationState,
   readStatsState,
   type StatePaths,
   withStateLock,
   writeCaptureDedupeState,
+  writeConsolidationState,
   writeLifecycleState,
   writeRemediationState,
   writeStatsState,
 } from "./state.js";
+import {
+  buildTimeRange,
+  formatTimeRange,
+  inferQuerySpecificity,
+  isResultInTimeRange,
+  resolveResultTimeMs,
+  type TimeRange,
+} from "./temporal.js";
 import type {
   CaptureIntent,
+  ConsolidationReason,
   LifecycleEntry,
   MemoryKind,
+  MemoryLayer,
   MemoryOwner,
   MemoryBraidResult,
   PendingInboundTurn,
@@ -71,7 +97,7 @@ function jsonToolResult(payload: unknown) {
   return {
     content: [
       {
-        type: "text",
+        type: "text" as const,
         text: JSON.stringify(payload, null, 2),
       },
     ],
@@ -160,6 +186,13 @@ function resolveCommandScope(config?: unknown): {
 } {
   return {
     workspaceHash: workspaceHashFromDir(resolveWorkspaceDirFromConfig(config)),
+  };
+}
+
+function resolveCommandPersistentScope(config?: unknown): ScopeKey {
+  return {
+    workspaceHash: workspaceHashFromDir(resolveWorkspaceDirFromConfig(config)),
+    agentId: "main",
   };
 }
 
@@ -472,12 +505,26 @@ function inferRecallTarget(result: MemoryBraidResult): RecallTarget {
   return normalizeRecallTarget(metadata.recallTarget) ?? "both";
 }
 
+function inferMemoryLayer(result: MemoryBraidResult): MemoryLayer {
+  return inferNormalizedMemoryLayer(result);
+}
+
 function normalizeSessionKey(raw: unknown): string | undefined {
   if (typeof raw !== "string") {
     return undefined;
   }
   const trimmed = raw.trim();
   return trimmed || undefined;
+}
+
+function summarizeResultTaxonomy(result: MemoryBraidResult): string {
+  const metadata = asRecord(result.metadata);
+  const taxonomy = buildTaxonomy({
+    text: result.snippet,
+    entities: metadata.entities,
+    existingTaxonomy: metadata.taxonomy,
+  });
+  return formatTaxonomySummary(taxonomy) || "n/a";
 }
 
 function isGenericUserSummary(text: string): boolean {
@@ -504,6 +551,7 @@ function applyMem0QualityAdjustments(params: {
   query: string;
   scope: ScopeKey;
   nowMs: number;
+  timeRange?: TimeRange;
 }): {
   results: MemoryBraidResult[];
   adjusted: number;
@@ -528,6 +576,7 @@ function applyMem0QualityAdjustments(params: {
   }
 
   const queryTokens = tokenizeForOverlap(params.query);
+  const specificity = inferQuerySpecificity(params.query);
   let adjusted = 0;
   let overlapBoosted = 0;
   let overlapPenalized = 0;
@@ -542,6 +591,7 @@ function applyMem0QualityAdjustments(params: {
     const overlap = lexicalOverlap(queryTokens, result.snippet);
     const category = normalizeCategory(metadata.category);
     const isGeneric = isGenericUserSummary(result.snippet);
+    const layer = inferMemoryLayer(result);
     const ts = resolveTimestampMs(result);
     const ageDays = ts ? Math.max(0, (params.nowMs - ts) / (24 * 60 * 60 * 1000)) : undefined;
 
@@ -588,6 +638,26 @@ function applyMem0QualityAdjustments(params: {
     if (isGeneric && overlap.ratio < 0.2 && overlap.shared < 2) {
       multiplier *= 0.6;
       genericPenalized += 1;
+    }
+
+    if (metadata.supersededBy || metadata.supersededAt) {
+      multiplier *= 0.2;
+    }
+
+    if (params.timeRange) {
+      if (isResultInTimeRange(result, params.timeRange)) {
+        multiplier *= layer === "episodic" ? 1.6 : 1.05;
+      } else {
+        multiplier *= layer === "episodic" ? 0.15 : 0.55;
+      }
+    } else if (specificity === "broad") {
+      if (layer === "semantic") {
+        multiplier *= 1.18;
+      } else if (layer === "episodic" && (metadata.consolidatedAt || metadata.compendiumKey)) {
+        multiplier *= 0.82;
+      }
+    } else if (specificity === "specific" && layer === "episodic") {
+      multiplier *= 1.1;
     }
 
     const normalizedMultiplier = Math.min(2.5, Math.max(0.1, multiplier));
@@ -754,6 +824,10 @@ function resolveDateFromPath(pathValue?: string): number | undefined {
 }
 
 function resolveTimestampMs(result: MemoryBraidResult): number | undefined {
+  const normalized = resolveResultTimeMs(result);
+  if (normalized) {
+    return normalized;
+  }
   const metadata = asRecord(result.metadata);
   const fields = [
     metadata.indexedAt,
@@ -1106,13 +1180,21 @@ async function runMem0Recall(params: {
   statePaths?: StatePaths | null;
   runId: string;
 }): Promise<MemoryBraidResult[]> {
+  const builtTimeRange = buildTimeRange({
+    query: params.query,
+    enabled: params.cfg.consolidation.timeQueryParsing,
+  });
+  const effectiveQuery = builtTimeRange.queryWithoutTime || params.query;
+  const fetchLimit = builtTimeRange.range
+    ? Math.max(params.maxResults, Math.min(200, params.maxResults * 4))
+    : params.maxResults;
   const remediationState = params.statePaths
     ? await readRemediationState(params.statePaths)
     : undefined;
 
   const persistentRaw = await params.mem0.searchMemories({
-    query: params.query,
-    maxResults: params.maxResults,
+    query: effectiveQuery,
+    maxResults: fetchLimit,
     scope: params.persistentScope,
     runId: params.runId,
   });
@@ -1129,8 +1211,8 @@ async function runMem0Recall(params: {
     params.legacyScope.sessionKey !== params.persistentScope.sessionKey
   ) {
     const legacyRaw = await params.mem0.searchMemories({
-      query: params.query,
-      maxResults: params.maxResults,
+      query: effectiveQuery,
+      maxResults: fetchLimit,
       scope: params.legacyScope,
       runId: params.runId,
     });
@@ -1143,6 +1225,14 @@ async function runMem0Recall(params: {
   }
 
   let combined = [...persistentFiltered.results, ...legacyFiltered];
+  if (builtTimeRange.range) {
+    combined = combined.filter((result) => {
+      if (inferMemoryLayer(result) === "semantic") {
+        return true;
+      }
+      return isResultInTimeRange(result, builtTimeRange.range);
+    });
+  }
   if (params.cfg.timeDecay.enabled) {
     const coreDecay = resolveCoreTemporalDecay({
       config: params.coreConfig,
@@ -1159,9 +1249,10 @@ async function runMem0Recall(params: {
 
   combined = applyMem0QualityAdjustments({
     results: combined,
-    query: params.query,
+    query: effectiveQuery,
     scope: params.runtimeScope,
     nowMs: Date.now(),
+    timeRange: builtTimeRange.range,
   }).results;
 
   const deduped = await stagedDedupe(sortMemoriesStable(combined), {
@@ -1186,6 +1277,7 @@ async function runMem0Recall(params: {
     legacyCount: legacyFiltered.length,
     quarantinedFiltered:
       persistentFiltered.quarantinedFiltered + legacyQuarantinedFiltered,
+    timeRange: builtTimeRange.range ? formatTimeRange(builtTimeRange.range) : "n/a",
     dedupedCount: deduped.length,
   });
 
@@ -1363,6 +1455,41 @@ function parseIntegerFlag(tokens: string[], flag: string, fallback: number): num
     return fallback;
   }
   return Math.max(1, Math.round(raw));
+}
+
+function parseStringFlag(tokens: string[], flag: string): string | undefined {
+  const index = tokens.findIndex((token) => token === flag);
+  if (index < 0 || index === tokens.length - 1) {
+    return undefined;
+  }
+  const raw = tokens[index + 1]?.trim();
+  return raw || undefined;
+}
+
+function hasFlag(tokens: string[], flag: string): boolean {
+  return tokens.includes(flag);
+}
+
+function stripFlags(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (
+      token === "--limit" ||
+      token === "--layer" ||
+      token === "--kind" ||
+      token === "--from" ||
+      token === "--to"
+    ) {
+      index += 1;
+      continue;
+    }
+    if (token === "--include-quarantined") {
+      continue;
+    }
+    out.push(token);
+  }
+  return out;
 }
 
 function resolveRecordScope(
@@ -1557,6 +1684,7 @@ const memoryBraidPlugin = {
     const assistantLearningWritesByRunScope = new Map<string, number[]>();
 
     let lifecycleTimer: NodeJS.Timeout | null = null;
+    let consolidationTimer: NodeJS.Timeout | null = null;
     let statePaths: StatePaths | null = null;
 
     async function ensureRuntimeStatePaths(): Promise<StatePaths | null> {
@@ -1616,6 +1744,7 @@ const memoryBraidPlugin = {
     }): Promise<{ accepted: boolean; reason: string; normalizedText: string; memoryId?: string }> {
       const validated = validateAtomicMemoryText(params.text);
       if (!validated.ok) {
+        const failedReason = validated.reason;
         if (params.runtimeStatePaths) {
           await withStateLock(params.runtimeStatePaths.stateLockFile, async () => {
             const stats = await readStatsState(params.runtimeStatePaths!);
@@ -1625,7 +1754,7 @@ const memoryBraidPlugin = {
         }
         return {
           accepted: false,
-          reason: validated.reason,
+          reason: failedReason,
           normalizedText: normalizeWhitespace(params.text),
         };
       }
@@ -1679,8 +1808,56 @@ const memoryBraidPlugin = {
         };
       }
 
+      const selection = scoreProceduralMemory({
+        text: validated.normalized,
+        confidence: params.confidence,
+        captureIntent: params.captureIntent,
+        cfg,
+      });
+      if (selection.decision !== "procedural") {
+        log.debug("memory_braid.capture.selection", {
+          runId: params.runId,
+          target: "procedural",
+          decision: selection.decision,
+          kind: params.kind,
+          captureIntent: params.captureIntent,
+          score: selection.score,
+          reasons: selection.reasons,
+          workspaceHash: params.runtimeScope.workspaceHash,
+          agentId: params.runtimeScope.agentId,
+          sessionKey: params.runtimeScope.sessionKey,
+          contentHashPrefix: exactHash.slice(0, 12),
+        });
+        if (params.runtimeStatePaths) {
+          await withStateLock(params.runtimeStatePaths.stateLockFile, async () => {
+            const stats = await readStatsState(params.runtimeStatePaths!);
+            stats.capture.agentLearningRejectedSelection += 1;
+            await writeStatsState(params.runtimeStatePaths!, stats);
+          });
+        }
+        return {
+          accepted: false,
+          reason: "selection_rejected",
+          normalizedText: validated.normalized,
+        };
+      }
+      log.debug("memory_braid.capture.selection", {
+        runId: params.runId,
+        target: "procedural",
+        decision: selection.decision,
+        kind: params.kind,
+        captureIntent: params.captureIntent,
+        score: selection.score,
+        reasons: selection.reasons,
+        workspaceHash: params.runtimeScope.workspaceHash,
+        agentId: params.runtimeScope.agentId,
+        sessionKey: params.runtimeScope.sessionKey,
+        contentHashPrefix: exactHash.slice(0, 12),
+      });
+
       const metadata: Record<string, unknown> = {
         sourceType: "agent_learning",
+        memoryLayer: "procedural",
         memoryOwner: "agent",
         memoryKind: params.kind,
         captureIntent: params.captureIntent,
@@ -1690,7 +1867,13 @@ const memoryBraidPlugin = {
         agentId: params.runtimeScope.agentId,
         sessionKey: params.runtimeScope.sessionKey,
         indexedAt: new Date().toISOString(),
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        eventAt: new Date().toISOString(),
         contentHash: exactHash,
+        selectionDecision: selection.decision,
+        rememberabilityScore: selection.score,
+        rememberabilityReasons: selection.reasons,
       };
       if (typeof params.confidence === "number") {
         metadata.confidence = Math.max(0, Math.min(1, params.confidence));
@@ -1723,6 +1906,288 @@ const memoryBraidPlugin = {
         normalizedText: validated.normalized,
         memoryId: addResult.id,
       };
+    }
+
+    async function runConsolidationOnce(params: {
+      scope: ScopeKey;
+      reason: ConsolidationReason;
+      runtimeStatePaths?: StatePaths | null;
+      runId: string;
+    }): Promise<{
+      candidates: number;
+      clusters: number;
+      created: number;
+      updated: number;
+      episodicMarked: number;
+      contradictions: number;
+      superseded: number;
+    }> {
+      if (!cfg.consolidation.enabled) {
+        return {
+          candidates: 0,
+          clusters: 0,
+          created: 0,
+          updated: 0,
+          episodicMarked: 0,
+          contradictions: 0,
+          superseded: 0,
+        };
+      }
+      const runtimeStatePaths = params.runtimeStatePaths ?? (await ensureRuntimeStatePaths());
+      if (!runtimeStatePaths) {
+        return {
+          candidates: 0,
+          clusters: 0,
+          created: 0,
+          updated: 0,
+          episodicMarked: 0,
+          contradictions: 0,
+          superseded: 0,
+        };
+      }
+
+      const [allMemories, remediationState, lifecycle, consolidation] = await Promise.all([
+        mem0.getAllMemories({
+          scope: params.scope,
+          limit: 500,
+          runId: params.runId,
+        }),
+        readRemediationState(runtimeStatePaths),
+        readLifecycleState(runtimeStatePaths),
+        readConsolidationState(runtimeStatePaths),
+      ]);
+
+      const activeMemories = allMemories.filter((memory) => !isQuarantinedMemory(memory, remediationState).quarantined);
+      const episodic = activeMemories.filter((memory) => inferMemoryLayer(memory) === "episodic");
+      const semantic = activeMemories.filter((memory) => inferMemoryLayer(memory) === "semantic");
+
+      const draftPlan = await buildConsolidationDrafts({
+        episodic,
+        existingSemantic: semantic,
+        lifecycleEntries: lifecycle.entries,
+        cfg,
+        minSupportCount: cfg.consolidation.minSupportCount,
+        minRecallCount: cfg.consolidation.minRecallCount,
+        semanticMaxSourceIds: cfg.consolidation.semanticMaxSourceIds,
+        state: consolidation,
+        semanticSimilarity: async (leftText, rightText) =>
+          mem0.semanticSimilarity({
+            leftText,
+            rightText,
+            scope: params.scope,
+            runId: params.runId,
+          }),
+      });
+      log.debug("memory_braid.consolidation.plan", {
+        runId: params.runId,
+        reason: params.reason,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        candidates: draftPlan.candidates,
+        clusters: draftPlan.clustersFormed,
+        promotedDrafts: draftPlan.drafts.length,
+        drafts: draftPlan.drafts.map((draft) => ({
+          compendiumKeyPrefix: draft.compendiumKey.slice(0, 12),
+          existingMemoryId: draft.existingMemoryId ?? null,
+          kind: draft.kind,
+          anchor: draft.anchor ?? null,
+          sourceCount: draft.sourceMemories.length,
+          supportCount:
+            typeof asRecord(draft.metadata).supportCount === "number"
+              ? asRecord(draft.metadata).supportCount
+              : null,
+          promotionScore:
+            typeof asRecord(draft.metadata).promotionScore === "number"
+              ? asRecord(draft.metadata).promotionScore
+              : null,
+          promotionReasons: asRecord(draft.metadata).promotionReasons,
+        })),
+      });
+
+      let created = 0;
+      let updated = 0;
+      let episodicMarked = 0;
+      const semanticByKey = { ...consolidation.semanticByCompendiumKey };
+      const semanticMemoryIds = new Map<string, string>();
+      const contradictionCandidates = [...semantic];
+
+      for (const draft of draftPlan.drafts) {
+        let semanticMemoryId = draft.existingMemoryId;
+        if (draft.existingMemoryId) {
+          const updatedRemote = await mem0.updateMemoryMetadata({
+            memoryId: draft.existingMemoryId,
+            scope: params.scope,
+            text: draft.text,
+            metadata: draft.metadata,
+            runId: params.runId,
+          });
+          if (!updatedRemote) {
+            continue;
+          }
+          updated += 1;
+        } else {
+          const createdRemote = await mem0.addMemory({
+            text: draft.text,
+            scope: params.scope,
+            metadata: draft.metadata,
+            runId: params.runId,
+          });
+          if (!createdRemote.id) {
+            continue;
+          }
+          semanticMemoryId = createdRemote.id;
+          created += 1;
+        }
+
+        if (!semanticMemoryId) {
+          continue;
+        }
+        semanticMemoryIds.set(draft.compendiumKey, semanticMemoryId);
+        semanticByKey[draft.compendiumKey] = {
+          memoryId: semanticMemoryId,
+          updatedAt: Date.now(),
+        };
+
+        contradictionCandidates.push({
+          id: semanticMemoryId,
+          source: "mem0",
+          snippet: draft.text,
+          score: 0,
+          metadata: draft.metadata,
+        });
+
+        for (const sourceMemory of draft.sourceMemories) {
+          if (!sourceMemory.id) {
+            continue;
+          }
+          const updatedSource = await mem0.updateMemoryMetadata({
+            memoryId: sourceMemory.id,
+            scope: params.scope,
+            text: sourceMemory.snippet,
+            metadata: {
+              ...asRecord(sourceMemory.metadata),
+              memoryLayer: "episodic",
+              consolidatedAt: new Date().toISOString(),
+              compendiumKey: draft.compendiumKey,
+              semanticMemoryId,
+            },
+            runId: params.runId,
+          });
+          if (updatedSource) {
+            episodicMarked += 1;
+          }
+        }
+      }
+
+      const superseded = await findSupersededSemanticMemories({
+        semanticMemories: contradictionCandidates,
+        semanticSimilarity: async (leftText, rightText) =>
+          mem0.semanticSimilarity({
+            leftText,
+            rightText,
+            scope: params.scope,
+            runId: params.runId,
+          }),
+      });
+      let supersededMarked = 0;
+      if (superseded.length > 0) {
+        log.debug("memory_braid.consolidation.supersede", {
+          runId: params.runId,
+          reason: params.reason,
+          workspaceHash: params.scope.workspaceHash,
+          agentId: params.scope.agentId,
+          count: superseded.length,
+          updates: superseded.map((target) => ({
+            memoryId: target.memoryId,
+            supersededBy:
+              typeof asRecord(target.metadata).supersededBy === "string"
+                ? asRecord(target.metadata).supersededBy
+                : null,
+          })),
+        });
+      }
+      for (const target of superseded) {
+        const updatedRemote = await mem0.updateMemoryMetadata({
+          memoryId: target.memoryId,
+          scope: params.scope,
+          text: target.text,
+          metadata: target.metadata,
+          runId: params.runId,
+        });
+        if (updatedRemote) {
+          supersededMarked += 1;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      await withStateLock(runtimeStatePaths.stateLockFile, async () => {
+        const stats = await readStatsState(runtimeStatePaths);
+        const next = await readConsolidationState(runtimeStatePaths);
+        next.lastConsolidationAt = nowIso;
+        next.lastConsolidationReason = params.reason;
+        next.newEpisodicSinceLastRun = 0;
+        next.semanticByCompendiumKey = semanticByKey;
+        stats.capture.consolidationRuns += 1;
+        stats.capture.consolidationCandidates += draftPlan.candidates;
+        stats.capture.clustersFormed += draftPlan.clustersFormed;
+        stats.capture.semanticCreated += created;
+        stats.capture.semanticUpdated += updated;
+        stats.capture.episodicMarkedConsolidated += episodicMarked;
+        stats.capture.contradictionsDetected += superseded.length;
+        stats.capture.supersededMarked += supersededMarked;
+        stats.capture.lastConsolidationAt = nowIso;
+        await writeConsolidationState(runtimeStatePaths, next);
+        await writeStatsState(runtimeStatePaths, stats);
+      });
+
+      log.debug("memory_braid.consolidation.run", {
+        runId: params.runId,
+        reason: params.reason,
+        workspaceHash: params.scope.workspaceHash,
+        agentId: params.scope.agentId,
+        candidates: draftPlan.candidates,
+        clusters: draftPlan.clustersFormed,
+        created,
+        updated,
+        episodicMarked,
+        contradictions: superseded.length,
+        supersededMarked,
+      });
+
+      return {
+        candidates: draftPlan.candidates,
+        clusters: draftPlan.clustersFormed,
+        created,
+        updated,
+        episodicMarked,
+        contradictions: superseded.length,
+        superseded: supersededMarked,
+      };
+    }
+
+    async function maybeRunOpportunisticConsolidation(params: {
+      scope: ScopeKey;
+      runtimeStatePaths: StatePaths;
+      runId: string;
+    }): Promise<void> {
+      if (!cfg.consolidation.enabled) {
+        return;
+      }
+      const state = await readConsolidationState(params.runtimeStatePaths);
+      const lastRunAt = state.lastConsolidationAt ? Date.parse(state.lastConsolidationAt) : 0;
+      const minutesSinceLastRun =
+        lastRunAt > 0 ? (Date.now() - lastRunAt) / (60 * 1000) : Number.POSITIVE_INFINITY;
+      const enoughNew = state.newEpisodicSinceLastRun >= cfg.consolidation.opportunisticNewMemoryThreshold;
+      const enoughTime = minutesSinceLastRun >= cfg.consolidation.opportunisticMinMinutesSinceLastRun;
+      if (!enoughNew && !enoughTime) {
+        return;
+      }
+      await runConsolidationOnce({
+        scope: params.scope,
+        reason: "opportunistic",
+        runtimeStatePaths: params.runtimeStatePaths,
+        runId: params.runId,
+      });
     }
 
     api.registerTool(
@@ -1915,7 +2380,8 @@ const memoryBraidPlugin = {
 
     api.registerCommand({
       name: "memorybraid",
-      description: "Memory Braid status, stats, remediation, lifecycle cleanup, and entity extraction warmup.",
+      description:
+        "Memory Braid status, stats, search, consolidation, remediation, lifecycle cleanup, and entity extraction warmup.",
       acceptsArgs: true,
       handler: async (ctx) => {
         const args = ctx.args?.trim() ?? "";
@@ -1927,6 +2393,15 @@ const memoryBraidPlugin = {
             config: ctx.config,
           });
           const paths = await ensureRuntimeStatePaths();
+          const consolidation = paths
+            ? await readConsolidationState(paths)
+            : {
+                version: 1 as const,
+                semanticByCompendiumKey: {},
+                newEpisodicSinceLastRun: 0,
+                lastConsolidationAt: undefined,
+                lastConsolidationReason: undefined,
+              };
           const lifecycle =
             cfg.lifecycle.enabled && paths
               ? await readLifecycleState(paths)
@@ -1935,6 +2410,11 @@ const memoryBraidPlugin = {
             text: [
               `capture.mode: ${cfg.capture.mode}`,
               `capture.includeAssistant: ${cfg.capture.includeAssistant}`,
+              `capture.selection.minPreferenceDecisionScore: ${cfg.capture.selection.minPreferenceDecisionScore}`,
+              `capture.selection.minFactScore: ${cfg.capture.selection.minFactScore}`,
+              `capture.selection.minTaskScore: ${cfg.capture.selection.minTaskScore}`,
+              `capture.selection.minOtherScore: ${cfg.capture.selection.minOtherScore}`,
+              `capture.selection.minProceduralScore: ${cfg.capture.selection.minProceduralScore}`,
               `capture.assistant.autoCapture: ${cfg.capture.assistant.autoCapture}`,
               `capture.assistant.explicitTool: ${cfg.capture.assistant.explicitTool}`,
               `recall.user.injectTopK: ${cfg.recall.user.injectTopK}`,
@@ -1947,6 +2427,14 @@ const memoryBraidPlugin = {
               `lifecycle.captureTtlDays: ${cfg.lifecycle.captureTtlDays}`,
               `lifecycle.cleanupIntervalMinutes: ${cfg.lifecycle.cleanupIntervalMinutes}`,
               `lifecycle.reinforceOnRecall: ${cfg.lifecycle.reinforceOnRecall}`,
+              `consolidation.enabled: ${cfg.consolidation.enabled}`,
+              `consolidation.startupRun: ${cfg.consolidation.startupRun}`,
+              `consolidation.intervalMinutes: ${cfg.consolidation.intervalMinutes}`,
+              `consolidation.minSelectionScore: ${cfg.consolidation.minSelectionScore}`,
+              `consolidation.newEpisodicSinceLastRun: ${consolidation.newEpisodicSinceLastRun}`,
+              `consolidation.semanticTracked: ${Object.keys(consolidation.semanticByCompendiumKey).length}`,
+              `consolidation.lastConsolidationAt: ${consolidation.lastConsolidationAt ?? "n/a"}`,
+              `consolidation.lastConsolidationReason: ${consolidation.lastConsolidationReason ?? "n/a"}`,
               `lifecycle.tracked: ${Object.keys(lifecycle.entries).length}`,
               `lifecycle.lastCleanupAt: ${lifecycle.lastCleanupAt ?? "n/a"}`,
               `lifecycle.lastCleanupReason: ${lifecycle.lastCleanupReason ?? "n/a"}`,
@@ -1966,6 +2454,7 @@ const memoryBraidPlugin = {
 
           const stats = await readStatsState(paths);
           const lifecycle = await readLifecycleState(paths);
+          const consolidation = await readConsolidationState(paths);
           const capture = stats.capture;
           const mem0SuccessRate =
             capture.mem0AddAttempts > 0
@@ -2010,8 +2499,19 @@ const memoryBraidPlugin = {
               `- agentLearningAutoRejected: ${capture.agentLearningAutoRejected}`,
               `- agentLearningInjected: ${capture.agentLearningInjected}`,
               `- agentLearningRecallHits: ${capture.agentLearningRecallHits}`,
+              `- selectionSkipped: ${capture.selectionSkipped}`,
+              `- agentLearningRejectedSelection: ${capture.agentLearningRejectedSelection}`,
+              `- consolidationRuns: ${capture.consolidationRuns}`,
+              `- consolidationCandidates: ${capture.consolidationCandidates}`,
+              `- clustersFormed: ${capture.clustersFormed}`,
+              `- semanticCreated: ${capture.semanticCreated}`,
+              `- semanticUpdated: ${capture.semanticUpdated}`,
+              `- episodicMarkedConsolidated: ${capture.episodicMarkedConsolidated}`,
+              `- contradictionsDetected: ${capture.contradictionsDetected}`,
+              `- supersededMarked: ${capture.supersededMarked}`,
               `- lastRunAt: ${capture.lastRunAt ?? "n/a"}`,
               `- lastRemediationAt: ${capture.lastRemediationAt ?? "n/a"}`,
+              `- lastConsolidationAt: ${capture.lastConsolidationAt ?? "n/a"}`,
               "",
               "Lifecycle:",
               `- enabled: ${cfg.lifecycle.enabled}`,
@@ -2025,7 +2525,141 @@ const memoryBraidPlugin = {
               `- lastCleanupExpired: ${lifecycle.lastCleanupExpired ?? "n/a"}`,
               `- lastCleanupDeleted: ${lifecycle.lastCleanupDeleted ?? "n/a"}`,
               `- lastCleanupFailed: ${lifecycle.lastCleanupFailed ?? "n/a"}`,
+              "",
+              "Consolidation:",
+              `- enabled: ${cfg.consolidation.enabled}`,
+              `- startupRun: ${cfg.consolidation.startupRun}`,
+              `- intervalMinutes: ${cfg.consolidation.intervalMinutes}`,
+              `- minSelectionScore: ${cfg.consolidation.minSelectionScore}`,
+              `- newEpisodicSinceLastRun: ${consolidation.newEpisodicSinceLastRun}`,
+              `- semanticTracked: ${Object.keys(consolidation.semanticByCompendiumKey).length}`,
+              `- lastConsolidationAt: ${consolidation.lastConsolidationAt ?? "n/a"}`,
+              `- lastConsolidationReason: ${consolidation.lastConsolidationReason ?? "n/a"}`,
             ].join("\n"),
+          };
+        }
+
+        if (action === "search") {
+          const paths = await ensureRuntimeStatePaths();
+          if (!paths) {
+            return {
+              text: "Search unavailable: state directory is not ready.",
+              isError: true,
+            };
+          }
+
+          const queryTokens = stripFlags(tokens.slice(1));
+          const queryText = normalizeWhitespace(queryTokens.join(" "));
+          if (!queryText) {
+            return {
+              text:
+                "Usage: /memorybraid search <query> [--limit N] [--layer episodic|semantic|procedural|all] [--kind fact|preference|decision|task|heuristic|lesson|strategy|other] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--include-quarantined]",
+              isError: true,
+            };
+          }
+
+          const layer = parseStringFlag(tokens, "--layer") ?? "all";
+          const allowedLayers = new Set(["episodic", "semantic", "procedural", "all"]);
+          if (!allowedLayers.has(layer)) {
+            return {
+              text: "Invalid --layer. Use episodic, semantic, procedural, or all.",
+              isError: true,
+            };
+          }
+
+          const kind = parseStringFlag(tokens, "--kind");
+          if (
+            kind &&
+            ![
+              "fact",
+              "preference",
+              "decision",
+              "task",
+              "heuristic",
+              "lesson",
+              "strategy",
+              "other",
+            ].includes(kind)
+          ) {
+            return {
+              text: "Invalid --kind.",
+              isError: true,
+            };
+          }
+
+          const limit = Math.min(50, Math.max(1, parseIntegerFlag(tokens, "--limit", 10)));
+          const includeQuarantined = hasFlag(tokens, "--include-quarantined");
+          const timeRangeResult = buildTimeRange({
+            query: queryText,
+            from: parseStringFlag(tokens, "--from"),
+            to: parseStringFlag(tokens, "--to"),
+            enabled: cfg.consolidation.timeQueryParsing,
+          });
+          const effectiveQuery = timeRangeResult.queryWithoutTime || queryText;
+          const commandScope = resolveCommandPersistentScope(ctx.config);
+          const fetched = await mem0.searchMemories({
+            query: effectiveQuery,
+            maxResults: Math.min(200, Math.max(25, limit * 5)),
+            scope: commandScope,
+            runId: log.newRunId(),
+          });
+          const remediationState = await readRemediationState(paths);
+          const lifecycle = await readLifecycleState(paths);
+          let hiddenQuarantined = 0;
+          const filtered = fetched.filter((result) => {
+            const quarantine = isQuarantinedMemory(result, remediationState);
+            if (quarantine.quarantined && !includeQuarantined) {
+              hiddenQuarantined += 1;
+              return false;
+            }
+            if (layer !== "all" && inferMemoryLayer(result) !== layer) {
+              return false;
+            }
+            if (kind && inferMemoryKind(result) !== kind) {
+              return false;
+            }
+            if (timeRangeResult.range && !isResultInTimeRange(result, timeRangeResult.range)) {
+              return false;
+            }
+            return true;
+          });
+          const rows = filtered.slice(0, limit);
+          const lines = [
+            "Memory Braid search",
+            `- query: ${queryText}`,
+            `- effectiveQuery: ${effectiveQuery}`,
+            `- scope.workspaceHash: ${commandScope.workspaceHash}`,
+            `- scope.agentId: ${commandScope.agentId}`,
+            `- layer: ${layer}`,
+            `- kind: ${kind ?? "all"}`,
+            `- timeRange: ${formatTimeRange(timeRangeResult.range)}`,
+            `- fetched: ${fetched.length}`,
+            `- shown: ${rows.length}`,
+            `- hiddenQuarantined: ${hiddenQuarantined}`,
+          ];
+          if (rows.length === 0) {
+            lines.push("", "No matching memories.");
+            return { text: lines.join("\n") };
+          }
+          for (const [index, result] of rows.entries()) {
+            const metadata = asRecord(result.metadata);
+            const quarantine = isQuarantinedMemory(result, remediationState);
+            const lifecycleEntry =
+              result.id && lifecycle.entries[result.id] ? lifecycle.entries[result.id] : undefined;
+            lines.push(
+              "",
+              `${index + 1}. [${result.score.toFixed(3)}] ${result.id ?? "unknown"} ${result.snippet}`,
+              `   sourceType=${metadata.sourceType ?? "n/a"} layer=${inferMemoryLayer(result)} owner=${inferMemoryOwner(result)} kind=${inferMemoryKind(result)} stability=${metadata.stability ?? "n/a"}`,
+              `   selection=decision:${metadata.selectionDecision ?? "n/a"} score:${typeof metadata.rememberabilityScore === "number" ? metadata.rememberabilityScore.toFixed(2) : "n/a"} reasons:${Array.isArray(metadata.rememberabilityReasons) ? metadata.rememberabilityReasons.join(", ") : "n/a"}`,
+              `   timestamps=eventAt:${metadata.eventAt ?? "n/a"} firstSeenAt:${metadata.firstSeenAt ?? "n/a"} indexedAt:${metadata.indexedAt ?? "n/a"} updatedAt:${metadata.updatedAt ?? "n/a"}`,
+              `   taxonomy=${summarizeResultTaxonomy(result)}`,
+              `   provenance=captureOrigin:${metadata.captureOrigin ?? "n/a"} capturePath:${metadata.capturePath ?? "n/a"} pluginCaptureVersion:${metadata.pluginCaptureVersion ?? "n/a"}`,
+              `   quarantine=${quarantine.quarantined ? `yes (${quarantine.reason ?? "n/a"})` : "no"}`,
+              `   lifecycle=recallCount:${lifecycleEntry?.recallCount ?? "n/a"} lastRecalledAt:${lifecycleEntry?.lastRecalledAt ? new Date(lifecycleEntry.lastRecalledAt).toISOString() : "n/a"}`,
+            );
+          }
+          return {
+            text: lines.join("\n"),
           };
         }
 
@@ -2101,6 +2735,34 @@ const memoryBraidPlugin = {
           };
         }
 
+        if (action === "consolidate") {
+          const paths = await ensureRuntimeStatePaths();
+          if (!paths) {
+            return {
+              text: "Consolidation unavailable: state directory is not ready.",
+              isError: true,
+            };
+          }
+          const summary = await runConsolidationOnce({
+            scope: resolveCommandPersistentScope(ctx.config),
+            reason: "command",
+            runtimeStatePaths: paths,
+            runId: log.newRunId(),
+          });
+          return {
+            text: [
+              "Consolidation complete.",
+              `- candidates: ${summary.candidates}`,
+              `- clusters: ${summary.clusters}`,
+              `- semanticCreated: ${summary.created}`,
+              `- semanticUpdated: ${summary.updated}`,
+              `- episodicMarked: ${summary.episodicMarked}`,
+              `- contradictions: ${summary.contradictions}`,
+              `- supersededMarked: ${summary.superseded}`,
+            ].join("\n"),
+          };
+        }
+
         if (action === "warmup") {
           const runId = log.newRunId();
           const forceReload = tokens.some((token) => token === "--force");
@@ -2134,7 +2796,7 @@ const memoryBraidPlugin = {
 
         return {
           text:
-            "Usage: /memorybraid [status|stats|audit|remediate <audit|quarantine|delete|purge-all-captured> [--apply] [--limit N] [--sample N]|cleanup|warmup [--force]]",
+            "Usage: /memorybraid [status|stats|search <query> [--limit N] [--layer episodic|semantic|procedural|all] [--kind fact|preference|decision|task|heuristic|lesson|strategy|other] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--include-quarantined]|consolidate|audit|remediate <audit|quarantine|delete|purge-all-captured> [--apply] [--limit N] [--sample N]|cleanup|warmup [--force]]",
         };
       },
     });
@@ -2575,6 +3237,7 @@ const memoryBraidPlugin = {
       let mem0AddWithId = 0;
       let mem0AddWithoutId = 0;
       let remoteQuarantineFiltered = 0;
+      let selectionSkipped = 0;
       const remediationState = await readRemediationState(runtimeStatePaths);
       const successfulAdds: Array<{
         memoryId: string;
@@ -2644,8 +3307,10 @@ const memoryBraidPlugin = {
           continue;
         }
 
+        const indexedAt = new Date().toISOString();
         const metadata: Record<string, unknown> = {
           sourceType: "capture",
+          memoryLayer: "episodic",
           memoryOwner: "user",
           memoryKind: mapCategoryToMemoryKind(candidate.category),
           captureIntent: "observed",
@@ -2663,7 +3328,11 @@ const memoryBraidPlugin = {
           capturePath: captureInput.capturePath,
           pluginCaptureVersion: PLUGIN_CAPTURE_VERSION,
           contentHash: hash,
-          indexedAt: new Date().toISOString(),
+          indexedAt,
+          eventAt: indexedAt,
+          firstSeenAt: indexedAt,
+          lastSeenAt: indexedAt,
+          supportCount: 1,
         };
 
         if (cfg.entityExtraction.enabled) {
@@ -2677,6 +3346,50 @@ const memoryBraidPlugin = {
             metadata.entityUris = entities.map((entity) => entity.canonicalUri);
             metadata.entities = entities;
           }
+        }
+        metadata.taxonomy = buildTaxonomy({
+          text: candidate.text,
+          entities: metadata.entities,
+          existingTaxonomy: metadata.taxonomy,
+        });
+        metadata.taxonomySummary = formatTaxonomySummary(normalizeTaxonomy(metadata.taxonomy));
+        const selection = scoreObservedMemory({
+          text: candidate.text,
+          kind: mapCategoryToMemoryKind(candidate.category),
+          extractionScore: candidate.score,
+          taxonomy: normalizeTaxonomy(metadata.taxonomy),
+          source: candidate.source,
+          cfg,
+        });
+        metadata.selectionDecision = selection.decision;
+        metadata.rememberabilityScore = selection.score;
+        metadata.rememberabilityReasons = selection.reasons;
+        log.debug("memory_braid.capture.selection", {
+          runId,
+          target: "episodic",
+          decision: selection.decision,
+          kind: mapCategoryToMemoryKind(candidate.category),
+          source: candidate.source,
+          score: selection.score,
+          reasons: selection.reasons,
+          workspaceHash: scope.workspaceHash,
+          agentId: scope.agentId,
+          sessionKey: scope.sessionKey,
+          contentHashPrefix: hash.slice(0, 12),
+        });
+        if (selection.decision !== "episodic") {
+          selectionSkipped += 1;
+          log.debug("memory_braid.capture.skip", {
+            runId,
+            reason: "selection_rejected",
+            workspaceHash: scope.workspaceHash,
+            agentId: scope.agentId,
+            sessionKey: scope.sessionKey,
+            category: candidate.category,
+            score: selection.score,
+            reasons: selection.reasons,
+          });
+          continue;
         }
 
         const quarantine = isQuarantinedMemory(
@@ -2723,6 +3436,7 @@ const memoryBraidPlugin = {
 
       await withStateLock(runtimeStatePaths.stateLockFile, async () => {
         const dedupe = await readCaptureDedupeState(runtimeStatePaths);
+        const consolidation = await readConsolidationState(runtimeStatePaths);
         const stats = await readStatsState(runtimeStatePaths);
         const lifecycle = cfg.lifecycle.enabled
           ? await readLifecycleState(runtimeStatePaths)
@@ -2773,11 +3487,14 @@ const memoryBraidPlugin = {
         stats.capture.provenanceSkipped += provenanceSkipped;
         stats.capture.transcriptShapeSkipped += transcriptShapeSkipped;
         stats.capture.quarantinedFiltered += remoteQuarantineFiltered;
+        stats.capture.selectionSkipped += selectionSkipped;
         stats.capture.agentLearningAutoCaptured += agentLearningAutoCaptured;
         stats.capture.agentLearningAutoRejected += agentLearningAutoRejected;
         stats.capture.lastRunAt = new Date(now).toISOString();
+        consolidation.newEpisodicSinceLastRun += persisted;
 
         await writeCaptureDedupeState(runtimeStatePaths, dedupe);
+        await writeConsolidationState(runtimeStatePaths, consolidation);
         if (lifecycle) {
           await writeLifecycleState(runtimeStatePaths, lifecycle);
         }
@@ -2806,6 +3523,12 @@ const memoryBraidPlugin = {
           agentLearningAutoCaptured,
           agentLearningAutoRejected,
         }, true);
+      });
+
+      await maybeRunOpportunisticConsolidation({
+        scope: persistentScope,
+        runtimeStatePaths,
+        runId,
       });
     });
 
@@ -2848,6 +3571,12 @@ const memoryBraidPlugin = {
           lifecycleCaptureTtlDays: cfg.lifecycle.captureTtlDays,
           lifecycleCleanupIntervalMinutes: cfg.lifecycle.cleanupIntervalMinutes,
           lifecycleReinforceOnRecall: cfg.lifecycle.reinforceOnRecall,
+          consolidationEnabled: cfg.consolidation.enabled,
+          consolidationStartupRun: cfg.consolidation.startupRun,
+          consolidationIntervalMinutes: cfg.consolidation.intervalMinutes,
+          consolidationMinSupportCount: cfg.consolidation.minSupportCount,
+          consolidationMinRecallCount: cfg.consolidation.minRecallCount,
+          consolidationTimeQueryParsing: cfg.consolidation.timeQueryParsing,
           entityExtractionEnabled: cfg.entityExtraction.enabled,
           entityProvider: cfg.entityExtraction.provider,
           entityModel: cfg.entityExtraction.model,
@@ -2906,11 +3635,47 @@ const memoryBraidPlugin = {
             });
           }, intervalMs);
         }
+
+        if (cfg.consolidation.enabled && cfg.consolidation.startupRun) {
+          void runConsolidationOnce({
+            scope: resolveCommandPersistentScope(api.config),
+            reason: "startup",
+            runtimeStatePaths: statePaths,
+            runId,
+          }).catch((err) => {
+            log.warn("memory_braid.consolidation.run", {
+              runId,
+              reason: "startup",
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+
+        if (cfg.consolidation.enabled) {
+          const intervalMs = cfg.consolidation.intervalMinutes * 60 * 1000;
+          consolidationTimer = setInterval(() => {
+            void runConsolidationOnce({
+              scope: resolveCommandPersistentScope(api.config),
+              reason: "interval",
+              runtimeStatePaths: statePaths!,
+              runId: log.newRunId(),
+            }).catch((err) => {
+              log.warn("memory_braid.consolidation.run", {
+                reason: "interval",
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }, intervalMs);
+        }
       },
       stop: async () => {
         if (lifecycleTimer) {
           clearInterval(lifecycleTimer);
           lifecycleTimer = null;
+        }
+        if (consolidationTimer) {
+          clearInterval(consolidationTimer);
+          consolidationTimer = null;
         }
       },
     });

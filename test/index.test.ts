@@ -7,6 +7,7 @@ import { Mem0Adapter } from "../src/mem0-client.js";
 import {
   createStatePaths,
   readCaptureDedupeState,
+  readConsolidationState,
   readLifecycleState,
   readRemediationState,
   readStatsState,
@@ -237,8 +238,15 @@ describe("memory-braid plugin", () => {
         },
         metadata: expect.objectContaining({
           memoryOwner: "user",
+          memoryLayer: "episodic",
           captureOrigin: "external_user",
           capturePath: "before_message_write",
+          selectionDecision: "episodic",
+          rememberabilityScore: expect.any(Number),
+          eventAt: expect.any(String),
+          firstSeenAt: expect.any(String),
+          lastSeenAt: expect.any(String),
+          taxonomy: expect.any(Object),
         }),
       }),
     );
@@ -348,6 +356,7 @@ describe("memory-braid plugin", () => {
         },
         metadata: expect.objectContaining({
           sourceType: "agent_learning",
+          memoryLayer: "procedural",
           memoryOwner: "agent",
           memoryKind: "heuristic",
           captureIntent: "explicit_tool",
@@ -443,6 +452,47 @@ describe("memory-braid plugin", () => {
         }),
       }),
     );
+  });
+
+  it("skips low-value one-off task captures via deterministic selection", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "m-1" });
+    const { api, hooks } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const beforeWrite = hooks.find((entry) => entry.name === "before_message_write")?.handler as
+      | ((event: unknown) => Promise<void>)
+      | undefined;
+    const agentEndHook = hooks.find((entry) => entry.name === "agent_end")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<void>)
+      | undefined;
+
+    await beforeWrite?.({
+      agentId: "main",
+      sessionKey: "s1",
+      message: {
+        role: "user",
+        provenance: { kind: "external_user" },
+        content: [{ type: "text", text: "Todo: send the invoice tomorrow." }],
+      },
+    });
+
+    await agentEndHook?.(
+      {
+        success: true,
+        messages: [],
+      },
+      {
+        workspaceDir: path.join(tempDir, "workspace"),
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(addSpy).toHaveBeenCalledTimes(0);
+    const stats = await readStatsState(createStatePaths(stateDir));
+    expect(stats.capture.selectionSkipped).toBe(1);
   });
 
   it("rejects pasted multi-speaker transcripts from capture", async () => {
@@ -902,6 +952,86 @@ describe("memory-braid plugin", () => {
     );
   });
 
+  it("prefers in-range episodic memories for time-bounded recall prompts", async () => {
+    const searchSpy = vi
+      .spyOn(Mem0Adapter.prototype, "searchMemories")
+      .mockResolvedValueOnce([
+        {
+          id: "ep-june",
+          source: "mem0",
+          snippet: "We discussed moving standups to afternoons in June 2025.",
+          score: 0.71,
+          metadata: {
+            sourceType: "capture",
+            memoryLayer: "episodic",
+            memoryOwner: "user",
+            memoryKind: "decision",
+            eventAt: "2025-06-14T12:00:00.000Z",
+          },
+        },
+        {
+          id: "ep-march",
+          source: "mem0",
+          snippet: "We discussed sprint planning in March 2026.",
+          score: 0.95,
+          metadata: {
+            sourceType: "capture",
+            memoryLayer: "episodic",
+            memoryOwner: "user",
+            memoryKind: "decision",
+            eventAt: "2026-03-10T12:00:00.000Z",
+          },
+        },
+        {
+          id: "sem-general",
+          source: "mem0",
+          snippet: "Decision: Standups work best in the afternoon.",
+          score: 0.9,
+          metadata: {
+            sourceType: "compendium",
+            memoryLayer: "semantic",
+            memoryOwner: "user",
+            memoryKind: "decision",
+            lastSeenAt: "2026-03-01T12:00:00.000Z",
+          },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    const { api, hooks } = createApi({
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
+      | undefined;
+
+    const result = await beforeAgentStart!(
+      {
+        prompt: "What did we discuss in June?",
+      },
+      {
+        workspaceDir: "/tmp",
+        agentId: "main",
+        sessionKey: "s1",
+      },
+    );
+
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(result && "prependContext" in result ? result.prependContext : "").toContain(
+      "June 2025",
+    );
+    expect(result && "prependContext" in result ? result.prependContext : "").not.toContain(
+      "March 2026",
+    );
+  });
+
   it("injects only mem0 recall and ignores local-only matches", async () => {
     const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([]);
     const { api, hooks } = createApi({
@@ -1169,6 +1299,7 @@ describe("memory-braid plugin", () => {
     expect(commandResult.text).toContain("Memory Braid stats");
     expect(commandResult.text).toContain("mem0AddAttempts: 1");
     expect(commandResult.text).toContain("mem0AddWithId: 1");
+    expect(commandResult.text).toContain("consolidationRuns:");
 
     const stats = await readStatsState(createStatePaths(stateDir));
     expect(stats.capture.mem0AddAttempts).toBe(1);
@@ -1660,5 +1791,153 @@ describe("memory-braid plugin", () => {
         memoryId: "capture-1",
       }),
     );
+  });
+
+  it("searches mem0 audit records via /memorybraid search", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        id: "sem-1",
+        source: "mem0",
+        snippet: "Preference: Afternoon standups work best for planning.",
+        score: 0.93,
+        metadata: {
+          sourceType: "compendium",
+          memoryLayer: "semantic",
+          memoryOwner: "user",
+          memoryKind: "preference",
+          taxonomy: {
+            people: [],
+            places: [],
+            organizations: [],
+            projects: [],
+            tools: [],
+            topics: ["standups"],
+          },
+          indexedAt: "2026-03-01T12:00:00.000Z",
+          firstSeenAt: "2026-02-20T12:00:00.000Z",
+          lastSeenAt: "2026-03-01T12:00:00.000Z",
+        },
+      },
+    ]);
+    const { api, commands } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const command = commands.find((entry) => entry.name === "memorybraid");
+    const result = (await command?.handler({
+      args: "search standups --layer semantic --kind preference",
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "/memorybraid search standups --layer semantic --kind preference",
+      config: api.config,
+    })) as { text?: string };
+
+    expect(result.text).toContain("Memory Braid search");
+    expect(result.text).toContain("layer: semantic");
+    expect(result.text).toContain("kind: preference");
+    expect(result.text).toContain("taxonomy=topics=standups");
+  });
+
+  it("runs manual consolidation and updates consolidation state", async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
+    const stateDir = path.join(tempDir, "state");
+    vi.spyOn(Mem0Adapter.prototype, "getAllMemories").mockResolvedValue([
+      {
+        id: "ep-1",
+        source: "mem0",
+        snippet: "Remember that I prefer afternoon standups for planning.",
+        score: 0.81,
+        metadata: {
+          sourceType: "capture",
+          memoryLayer: "episodic",
+          memoryOwner: "user",
+          memoryKind: "preference",
+          sessionKey: "s1",
+          indexedAt: "2026-02-20T12:00:00.000Z",
+          firstSeenAt: "2026-02-20T12:00:00.000Z",
+          lastSeenAt: "2026-02-20T12:00:00.000Z",
+          taxonomy: {
+            people: [],
+            places: [],
+            organizations: [],
+            projects: ["Atlas"],
+            tools: [],
+            topics: ["standups"],
+          },
+        },
+      },
+      {
+        id: "ep-2",
+        source: "mem0",
+        snippet: "Remember that afternoon standups are better for planning work.",
+        score: 0.79,
+        metadata: {
+          sourceType: "capture",
+          memoryLayer: "episodic",
+          memoryOwner: "user",
+          memoryKind: "preference",
+          sessionKey: "s2",
+          indexedAt: "2026-03-01T12:00:00.000Z",
+          firstSeenAt: "2026-03-01T12:00:00.000Z",
+          lastSeenAt: "2026-03-01T12:00:00.000Z",
+          taxonomy: {
+            people: [],
+            places: [],
+            organizations: [],
+            projects: ["Atlas"],
+            tools: [],
+            topics: ["standups"],
+          },
+        },
+      },
+    ]);
+    await writeLifecycleState(createStatePaths(stateDir), {
+      version: 1,
+      entries: {
+        "ep-1": {
+          memoryId: "ep-1",
+          contentHash: "h-1",
+          workspaceHash: "wh",
+          agentId: "main",
+          sessionKey: "s1",
+          category: "preference",
+          createdAt: Date.parse("2026-02-20T12:00:00.000Z"),
+          lastCapturedAt: Date.parse("2026-02-20T12:00:00.000Z"),
+          lastRecalledAt: Date.parse("2026-03-05T12:00:00.000Z"),
+          recallCount: 1,
+          updatedAt: Date.parse("2026-03-05T12:00:00.000Z"),
+        },
+      },
+      lastCleanupAt: undefined,
+      lastCleanupReason: undefined,
+      lastCleanupScanned: undefined,
+      lastCleanupExpired: undefined,
+      lastCleanupDeleted: undefined,
+      lastCleanupFailed: undefined,
+    });
+    const addSpy = vi.spyOn(Mem0Adapter.prototype, "addMemory").mockResolvedValue({ id: "sem-1" });
+    const updateSpy = vi.spyOn(Mem0Adapter.prototype, "updateMemoryMetadata").mockResolvedValue(true);
+    const { api, commands } = createApi({ stateDir });
+
+    await plugin.register(api as never);
+    const command = commands.find((entry) => entry.name === "memorybraid");
+    const result = (await command?.handler({
+      args: "consolidate",
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "/memorybraid consolidate",
+      config: api.config,
+    })) as { text?: string };
+
+    expect(addSpy).toHaveBeenCalled();
+    expect(updateSpy).toHaveBeenCalled();
+    expect(result.text).toContain("Consolidation complete.");
+    expect(result.text).toContain("semanticCreated: 1");
+
+    const consolidation = await readConsolidationState(createStatePaths(stateDir));
+    expect(consolidation.lastConsolidationReason).toBe("command");
+    expect(consolidation.newEpisodicSinceLastRun).toBe(0);
+    expect(Object.keys(consolidation.semanticByCompendiumKey)).toHaveLength(1);
   });
 });

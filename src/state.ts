@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   CaptureDedupeState,
+  ConsolidationState,
   LifecycleState,
   PluginStatsState,
   RemediationState,
@@ -47,6 +48,16 @@ const DEFAULT_STATS: PluginStatsState = {
     agentLearningAutoRejected: 0,
     agentLearningInjected: 0,
     agentLearningRecallHits: 0,
+    selectionSkipped: 0,
+    agentLearningRejectedSelection: 0,
+    consolidationRuns: 0,
+    consolidationCandidates: 0,
+    clustersFormed: 0,
+    semanticCreated: 0,
+    semanticUpdated: 0,
+    episodicMarkedConsolidated: 0,
+    contradictionsDetected: 0,
+    supersededMarked: 0,
   },
 };
 
@@ -55,12 +66,19 @@ const DEFAULT_REMEDIATION: RemediationState = {
   quarantined: {},
 };
 
+const DEFAULT_CONSOLIDATION: ConsolidationState = {
+  version: 1,
+  newEpisodicSinceLastRun: 0,
+  semanticByCompendiumKey: {},
+};
+
 export type StatePaths = {
   rootDir: string;
   captureDedupeFile: string;
   lifecycleFile: string;
   statsFile: string;
   remediationFile: string;
+  consolidationFile: string;
   stateLockFile: string;
 };
 
@@ -72,6 +90,7 @@ export function createStatePaths(stateDir: string): StatePaths {
     lifecycleFile: path.join(rootDir, "lifecycle.v1.json"),
     statsFile: path.join(rootDir, "stats.v1.json"),
     remediationFile: path.join(rootDir, "remediation.v1.json"),
+    consolidationFile: path.join(rootDir, "consolidation.v1.json"),
     stateLockFile: path.join(rootDir, "state.v1.lock"),
   };
 }
@@ -158,6 +177,27 @@ export async function writeRemediationState(
   state: RemediationState,
 ): Promise<void> {
   await writeJsonFile(paths.remediationFile, state);
+}
+
+export async function readConsolidationState(paths: StatePaths): Promise<ConsolidationState> {
+  const value = await readJsonFile(paths.consolidationFile, DEFAULT_CONSOLIDATION);
+  return {
+    version: 1,
+    lastConsolidationAt: value.lastConsolidationAt,
+    lastConsolidationReason: value.lastConsolidationReason,
+    newEpisodicSinceLastRun:
+      typeof value.newEpisodicSinceLastRun === "number" && Number.isFinite(value.newEpisodicSinceLastRun)
+        ? Math.max(0, Math.round(value.newEpisodicSinceLastRun))
+        : 0,
+    semanticByCompendiumKey: { ...(value.semanticByCompendiumKey ?? {}) },
+  };
+}
+
+export async function writeConsolidationState(
+  paths: StatePaths,
+  state: ConsolidationState,
+): Promise<void> {
+  await writeJsonFile(paths.consolidationFile, state);
 }
 
 export async function withStateLock<T>(

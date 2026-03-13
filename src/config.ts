@@ -33,6 +33,13 @@ export type MemoryBraidConfig = {
     mode: "local" | "hybrid" | "ml";
     includeAssistant: boolean;
     maxItemsPerRun: number;
+    selection: {
+      minPreferenceDecisionScore: number;
+      minFactScore: number;
+      minTaskScore: number;
+      minOtherScore: number;
+      minProceduralScore: number;
+    };
     assistant: {
       enabled: boolean;
       autoCapture: boolean;
@@ -79,6 +86,18 @@ export type MemoryBraidConfig = {
     cleanupIntervalMinutes: number;
     reinforceOnRecall: boolean;
   };
+  consolidation: {
+    enabled: boolean;
+    startupRun: boolean;
+    intervalMinutes: number;
+    opportunisticNewMemoryThreshold: number;
+    opportunisticMinMinutesSinceLastRun: number;
+    minSupportCount: number;
+    minRecallCount: number;
+    minSelectionScore: number;
+    semanticMaxSourceIds: number;
+    timeQueryParsing: boolean;
+  };
   debug: {
     enabled: boolean;
     includePayloads: boolean;
@@ -122,6 +141,13 @@ const DEFAULTS: MemoryBraidConfig = {
     mode: "local",
     includeAssistant: false,
     maxItemsPerRun: 6,
+    selection: {
+      minPreferenceDecisionScore: 0.45,
+      minFactScore: 0.52,
+      minTaskScore: 0.72,
+      minOtherScore: 0.82,
+      minProceduralScore: 0.58,
+    },
     assistant: {
       enabled: true,
       autoCapture: false,
@@ -168,6 +194,18 @@ const DEFAULTS: MemoryBraidConfig = {
     cleanupIntervalMinutes: 360,
     reinforceOnRecall: true,
   },
+  consolidation: {
+    enabled: true,
+    startupRun: true,
+    intervalMinutes: 360,
+    opportunisticNewMemoryThreshold: 5,
+    opportunisticMinMinutesSinceLastRun: 30,
+    minSupportCount: 2,
+    minRecallCount: 2,
+    minSelectionScore: 0.56,
+    semanticMaxSourceIds: 20,
+    timeQueryParsing: true,
+  },
   debug: {
     enabled: false,
     includePayloads: false,
@@ -212,6 +250,7 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const recallAgent = asRecord(recall.agent);
   const merge = asRecord(recall.merge);
   const capture = asRecord(root.capture);
+  const captureSelection = asRecord(capture.selection);
   const captureAssistant = asRecord(capture.assistant);
   const entityExtraction = asRecord(root.entityExtraction);
   const entityStartup = asRecord(entityExtraction.startup);
@@ -221,6 +260,7 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
   const semantic = asRecord(dedupe.semantic);
   const timeDecay = asRecord(root.timeDecay);
   const lifecycle = asRecord(root.lifecycle);
+  const consolidation = asRecord(root.consolidation);
   const debug = asRecord(root.debug);
 
   const mode = mem0.mode === "oss" ? "oss" : "cloud";
@@ -301,6 +341,38 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
       mode: captureMode,
       includeAssistant,
       maxItemsPerRun: asInt(capture.maxItemsPerRun, DEFAULTS.capture.maxItemsPerRun, 1, 50),
+      selection: {
+        minPreferenceDecisionScore: asNumber(
+          captureSelection.minPreferenceDecisionScore,
+          DEFAULTS.capture.selection.minPreferenceDecisionScore,
+          0,
+          1,
+        ),
+        minFactScore: asNumber(
+          captureSelection.minFactScore,
+          DEFAULTS.capture.selection.minFactScore,
+          0,
+          1,
+        ),
+        minTaskScore: asNumber(
+          captureSelection.minTaskScore,
+          DEFAULTS.capture.selection.minTaskScore,
+          0,
+          1,
+        ),
+        minOtherScore: asNumber(
+          captureSelection.minOtherScore,
+          DEFAULTS.capture.selection.minOtherScore,
+          0,
+          1,
+        ),
+        minProceduralScore: asNumber(
+          captureSelection.minProceduralScore,
+          DEFAULTS.capture.selection.minProceduralScore,
+          0,
+          1,
+        ),
+      },
       assistant: {
         enabled: asBoolean(
           captureAssistant.enabled,
@@ -409,6 +481,56 @@ export function parseConfig(raw: unknown): MemoryBraidConfig {
       reinforceOnRecall: asBoolean(
         lifecycle.reinforceOnRecall,
         DEFAULTS.lifecycle.reinforceOnRecall,
+      ),
+    },
+    consolidation: {
+      enabled: asBoolean(consolidation.enabled, DEFAULTS.consolidation.enabled),
+      startupRun: asBoolean(consolidation.startupRun, DEFAULTS.consolidation.startupRun),
+      intervalMinutes: asInt(
+        consolidation.intervalMinutes,
+        DEFAULTS.consolidation.intervalMinutes,
+        1,
+        10080,
+      ),
+      opportunisticNewMemoryThreshold: asInt(
+        consolidation.opportunisticNewMemoryThreshold,
+        DEFAULTS.consolidation.opportunisticNewMemoryThreshold,
+        1,
+        100,
+      ),
+      opportunisticMinMinutesSinceLastRun: asInt(
+        consolidation.opportunisticMinMinutesSinceLastRun,
+        DEFAULTS.consolidation.opportunisticMinMinutesSinceLastRun,
+        1,
+        1440,
+      ),
+      minSupportCount: asInt(
+        consolidation.minSupportCount,
+        DEFAULTS.consolidation.minSupportCount,
+        1,
+        50,
+      ),
+      minRecallCount: asInt(
+        consolidation.minRecallCount,
+        DEFAULTS.consolidation.minRecallCount,
+        1,
+        100,
+      ),
+      minSelectionScore: asNumber(
+        consolidation.minSelectionScore,
+        DEFAULTS.consolidation.minSelectionScore,
+        0,
+        1,
+      ),
+      semanticMaxSourceIds: asInt(
+        consolidation.semanticMaxSourceIds,
+        DEFAULTS.consolidation.semanticMaxSourceIds,
+        1,
+        200,
+      ),
+      timeQueryParsing: asBoolean(
+        consolidation.timeQueryParsing,
+        DEFAULTS.consolidation.timeQueryParsing,
       ),
     },
     debug: {

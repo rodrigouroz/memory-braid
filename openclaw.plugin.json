@@ -72,6 +72,17 @@
           },
           "includeAssistant": { "type": "boolean", "default": false },
           "maxItemsPerRun": { "type": "integer", "minimum": 1, "maximum": 50, "default": 6 },
+          "selection": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "minPreferenceDecisionScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.45 },
+              "minFactScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.52 },
+              "minTaskScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.72 },
+              "minOtherScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.82 },
+              "minProceduralScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.58 }
+            }
+          },
           "assistant": {
             "type": "object",
             "additionalProperties": false,
@@ -168,6 +179,42 @@
             "default": 360
           },
           "reinforceOnRecall": { "type": "boolean", "default": true }
+        }
+      },
+      "consolidation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "startupRun": { "type": "boolean", "default": true },
+          "intervalMinutes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10080,
+            "default": 360
+          },
+          "opportunisticNewMemoryThreshold": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 5
+          },
+          "opportunisticMinMinutesSinceLastRun": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1440,
+            "default": 30
+          },
+          "minSupportCount": { "type": "integer", "minimum": 1, "maximum": 50, "default": 2 },
+          "minRecallCount": { "type": "integer", "minimum": 1, "maximum": 100, "default": 2 },
+          "minSelectionScore": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.56 },
+          "semanticMaxSourceIds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 20
+          },
+          "timeQueryParsing": { "type": "boolean", "default": true }
         }
       },
       "debug": {
