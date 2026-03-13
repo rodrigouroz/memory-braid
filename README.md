@@ -110,7 +110,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.5.0
+openclaw plugins install memory-braid@0.7.0
 ```
 
 2. Rebuild native dependencies inside the installed extension:
