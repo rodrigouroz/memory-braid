@@ -14,6 +14,14 @@ describe("parseConfig", () => {
     expect(cfg.lifecycle.captureTtlDays).toBe(90);
     expect(cfg.lifecycle.cleanupIntervalMinutes).toBe(360);
     expect(cfg.lifecycle.reinforceOnRecall).toBe(true);
+    expect(cfg.consolidation.enabled).toBe(true);
+    expect(cfg.consolidation.startupRun).toBe(true);
+    expect(cfg.consolidation.intervalMinutes).toBe(360);
+    expect(cfg.consolidation.minSupportCount).toBe(2);
+    expect(cfg.capture.selection.minPreferenceDecisionScore).toBe(0.45);
+    expect(cfg.capture.selection.minProceduralScore).toBe(0.58);
+    expect(cfg.consolidation.minSelectionScore).toBe(0.56);
+    expect(cfg.consolidation.timeQueryParsing).toBe(true);
   });
 
   it("keeps oss mode and ossConfig object", () => {
@@ -50,6 +58,10 @@ describe("parseConfig", () => {
         mode: "ml",
         includeAssistant: true,
         maxItemsPerRun: 12,
+        selection: {
+          minFactScore: 0.6,
+          minProceduralScore: 0.62,
+        },
         ml: {
           provider: "openai",
           model: "gpt-4o-mini",
@@ -64,6 +76,12 @@ describe("parseConfig", () => {
         cleanupIntervalMinutes: 120,
         reinforceOnRecall: false,
       },
+      consolidation: {
+        intervalMinutes: 180,
+        minSupportCount: 3,
+        minSelectionScore: 0.64,
+        semanticMaxSourceIds: 12,
+      },
       entityExtraction: {
         enabled: true,
       },
@@ -73,11 +91,17 @@ describe("parseConfig", () => {
     expect(cfg.capture.includeAssistant).toBe(true);
     expect(cfg.capture.assistant.autoCapture).toBe(true);
     expect(cfg.capture.maxItemsPerRun).toBe(12);
+    expect(cfg.capture.selection.minFactScore).toBe(0.6);
+    expect(cfg.capture.selection.minProceduralScore).toBe(0.62);
     expect(cfg.timeDecay.enabled).toBe(true);
     expect(cfg.lifecycle.enabled).toBe(true);
     expect(cfg.lifecycle.captureTtlDays).toBe(30);
     expect(cfg.lifecycle.cleanupIntervalMinutes).toBe(120);
     expect(cfg.lifecycle.reinforceOnRecall).toBe(false);
+    expect(cfg.consolidation.intervalMinutes).toBe(180);
+    expect(cfg.consolidation.minSupportCount).toBe(3);
+    expect(cfg.consolidation.minSelectionScore).toBe(0.64);
+    expect(cfg.consolidation.semanticMaxSourceIds).toBe(12);
     expect(cfg.entityExtraction.enabled).toBe(true);
     expect(cfg.entityExtraction.provider).toBe("multilingual_ner");
     expect(cfg.entityExtraction.timeoutMs).toBe(2500);

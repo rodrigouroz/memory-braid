@@ -24,6 +24,19 @@ export type RecallTarget = "response" | "planning" | "both";
 
 export type Stability = "ephemeral" | "session" | "durable";
 
+export type MemoryLayer = "episodic" | "semantic" | "procedural";
+
+export type MemorySelectionDecision = "ignore" | "episodic" | "procedural" | "semantic";
+
+export type TaxonomyBuckets = {
+  people: string[];
+  places: string[];
+  organizations: string[];
+  projects: string[];
+  tools: string[];
+  topics: string[];
+};
+
 export type ScopeKey = {
   workspaceHash: string;
   agentId: string;
@@ -102,8 +115,19 @@ export type CaptureStats = {
   agentLearningAutoRejected: number;
   agentLearningInjected: number;
   agentLearningRecallHits: number;
+  selectionSkipped: number;
+  agentLearningRejectedSelection: number;
+  consolidationRuns: number;
+  consolidationCandidates: number;
+  clustersFormed: number;
+  semanticCreated: number;
+  semanticUpdated: number;
+  episodicMarkedConsolidated: number;
+  contradictionsDetected: number;
+  supersededMarked: number;
   lastRunAt?: string;
   lastRemediationAt?: string;
+  lastConsolidationAt?: string;
 };
 
 export type PluginStatsState = {
@@ -147,6 +171,22 @@ export type RemediationState = {
       reason: string;
       quarantinedAt: string;
       updatedRemotely?: boolean;
+    }
+  >;
+};
+
+export type ConsolidationReason = "startup" | "interval" | "opportunistic" | "command";
+
+export type ConsolidationState = {
+  version: 1;
+  lastConsolidationAt?: string;
+  lastConsolidationReason?: ConsolidationReason;
+  newEpisodicSinceLastRun: number;
+  semanticByCompendiumKey: Record<
+    string,
+    {
+      memoryId: string;
+      updatedAt: number;
     }
   >;
 };

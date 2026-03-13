@@ -5,9 +5,14 @@ Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory s
 ## Features
 
 - Hybrid recall: local memory + Mem0, merged with weighted RRF.
+- Layered Mem0 memory: episodic captures, semantic compendium memories, and procedural agent learnings.
 - Capture-first Mem0 memory: plugin writes only captured memories to Mem0 (no markdown/session indexing).
 - Capture pipeline modes: `local`, `hybrid`, `ml`.
+- Deterministic memory selection policy: ML may suggest candidates, but plugin code decides `ignore|episodic|procedural|semantic` using local thresholds and heuristics.
 - Optional entity extraction: local multilingual NER or OpenAI NER with canonical `entity://...` URIs in memory metadata.
+- Lightweight taxonomy on captured and semantic memories: `people`, `places`, `organizations`, `projects`, `tools`, `topics`.
+- Time-aware retrieval for month-style prompts such as `in June`, `this month`, and `last month`.
+- Automatic consolidation loop that promotes repeated episodic memories into semantic compendium memories.
 - Structured debug logs for troubleshooting and tuning.
 - Debug-only LLM usage observability: per-turn cache usage, rolling windows, and rising/stable/improving trend logs.
 
@@ -21,11 +26,14 @@ This release hardens capture and remediation for historical installs.
 - Metadata: new captured memories now include additive provenance fields such as `captureOrigin`, `captureMessageHash`, `captureTurnHash`, `capturePath`, and `pluginCaptureVersion`.
 - Historical installs: no startup mutation is performed automatically. Operators should audit first, then explicitly quarantine or delete suspicious captured memories.
 
-## Remediation commands
+## Command surface
 
-Memory Braid now exposes read-only audit and explicit remediation commands:
+Memory Braid exposes audit, search, consolidation, and remediation commands:
 
 ```bash
+/memorybraid search standups --layer semantic --kind preference
+/memorybraid search "What did we discuss in June?" --layer episodic
+/memorybraid consolidate
 /memorybraid audit
 /memorybraid remediate audit
 /memorybraid remediate quarantine
@@ -36,6 +44,10 @@ Memory Braid now exposes read-only audit and explicit remediation commands:
 
 Notes:
 
+- `search` is Mem0-only and intended for validating plugin-managed memory rather than local markdown memory.
+- `search` supports `--limit`, `--layer`, `--kind`, `--from`, `--to`, and `--include-quarantined`.
+- `consolidate` runs one compendium synthesis pass immediately and reports how many semantic memories were created or updated.
+- New capture metadata includes deterministic selection fields such as `selectionDecision`, `rememberabilityScore`, and `rememberabilityReasons`.
 - Dry-run is the default for remediation commands. Nothing mutates until you pass `--apply`.
 - `audit` reports counts by `sourceType`, `captureOrigin`, and `pluginCaptureVersion`, plus suspicious legacy samples.
 - `quarantine --apply` excludes suspicious captured memories from future Mem0 injection. It records quarantine state locally and also tags Mem0 metadata where supported.
@@ -98,7 +110,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.4.0
+openclaw plugins install memory-braid@0.5.0
 ```
 
 2. Rebuild native dependencies inside the installed extension:
@@ -225,6 +237,17 @@ Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
       "warmupText": "John works at Acme in Berlin."
     }
   },
+  "consolidation": {
+    "enabled": true,
+    "startupRun": true,
+    "intervalMinutes": 360,
+    "opportunisticNewMemoryThreshold": 5,
+    "opportunisticMinMinutesSinceLastRun": 30,
+    "minSupportCount": 2,
+    "minRecallCount": 2,
+    "semanticMaxSourceIds": 20,
+    "timeQueryParsing": true
+  },
   "debug": {
     "enabled": true
   }
@@ -283,6 +306,7 @@ Expected events:
 - `memory_braid.capture.extract`
 - `memory_braid.capture.ml` (for `capture.mode=hybrid|ml`)
 - `memory_braid.entity.extract`
+- `memory_braid.capture.selection`
 - `memory_braid.capture.persist`
 
 ## Self-hosting quick guide
@@ -569,6 +593,11 @@ Capture defaults are:
 - `capture.enabled`: `true`
 - `capture.mode`: `"local"`
 - `capture.includeAssistant`: `false` (legacy alias for `capture.assistant.autoCapture`)
+- `capture.selection.minPreferenceDecisionScore`: `0.45`
+- `capture.selection.minFactScore`: `0.52`
+- `capture.selection.minTaskScore`: `0.72`
+- `capture.selection.minOtherScore`: `0.82`
+- `capture.selection.minProceduralScore`: `0.58`
 - `capture.maxItemsPerRun`: `6`
 - `capture.assistant.enabled`: `true`
 - `capture.assistant.autoCapture`: `false`
@@ -588,6 +617,7 @@ Capture defaults are:
 - `timeDecay.enabled`: `false`
 - `lifecycle.enabled`: `false`
 - `lifecycle.captureTtlDays`: `90`
+- `consolidation.minSelectionScore`: `0.56`
 - `lifecycle.cleanupIntervalMinutes`: `360`
 - `lifecycle.reinforceOnRecall`: `true`
 
@@ -679,6 +709,8 @@ Key events:
 - `memory_braid.search.local|mem0|merge|inject|skip`
 - `memory_braid.search.mem0_decay`
 - `memory_braid.capture.extract|ml|persist|skip`
+- `memory_braid.capture.selection`
+- `memory_braid.consolidation.plan|run|supersede`
 - `memory_braid.lifecycle.reinforce|cleanup`
 - `memory_braid.entity.model_load|warmup|extract`
 - `memory_braid.mem0.request|response|error`
@@ -696,6 +728,8 @@ Traceability tips:
   - `mem0AddWithoutId`
   - `entityAnnotatedCandidates`
   - `totalEntitiesAttached`
+- `memory_braid.capture.selection` includes the deterministic routing decision, numeric rememberability score, and reasons used for `ignore|episodic|procedural`.
+- `memory_braid.consolidation.plan` includes the compendium drafts that passed deterministic promotion, including promotion score and reasons.
 - `memory_braid.capture.ml` includes `fallbackUsed` and fallback reasons when ML is unavailable.
 - `memory_braid.entity.extract` includes `entityTypes` and `sampleEntityUris`.
 
