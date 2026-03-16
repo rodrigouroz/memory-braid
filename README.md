@@ -110,7 +110,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.7.0
+openclaw plugins install memory-braid@0.7.1
 ```
 
 2. Rebuild native dependencies inside the installed extension:
@@ -233,13 +233,13 @@ Add this under `plugins.entries["memory-braid"].config` in your OpenClaw config:
     "minScore": 0.65,
     "maxEntitiesPerMemory": 8,
     "startup": {
-      "downloadOnStartup": true,
+      "downloadOnStartup": false,
       "warmupText": "John works at Acme in Berlin."
     }
   },
   "consolidation": {
     "enabled": true,
-    "startupRun": true,
+    "startupRun": false,
     "intervalMinutes": 360,
     "opportunisticNewMemoryThreshold": 5,
     "opportunisticMinMinutesSinceLastRun": 30,
@@ -558,7 +558,7 @@ Use this preset when:
         "minScore": 0.65,
         "maxEntitiesPerMemory": 8,
         "startup": {
-          "downloadOnStartup": true,
+          "downloadOnStartup": false,
           "warmupText": "John works at Acme in Berlin."
         }
       },
@@ -669,14 +669,14 @@ Entity extraction defaults are:
 - `entityExtraction.timeoutMs`: `2500`
 - `entityExtraction.minScore`: `0.65`
 - `entityExtraction.maxEntitiesPerMemory`: `8`
-- `entityExtraction.startup.downloadOnStartup`: `true`
+- `entityExtraction.startup.downloadOnStartup`: `false`
 - `entityExtraction.startup.warmupText`: `"John works at Acme in Berlin."`
 
 When enabled:
 
 - Local NER model cache/download path is `<OPENCLAW_STATE_DIR>/memory-braid/models/entity-extraction` (typically `~/.openclaw/memory-braid/models/entity-extraction`).
 - Captured memories get `metadata.entities` and `metadata.entityUris` (canonical IDs like `entity://person/john-doe`).
-- Startup warmup runs for both providers (`downloadOnStartup: true`).
+- Startup warmup is opt-in (`downloadOnStartup: false`) so model prewarm does not land on the critical gateway startup path.
 
 Warmup command:
 

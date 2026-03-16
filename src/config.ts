@@ -172,7 +172,7 @@ const DEFAULTS: MemoryBraidConfig = {
     minScore: 0.65,
     maxEntitiesPerMemory: 8,
     startup: {
-      downloadOnStartup: true,
+      downloadOnStartup: false,
       warmupText: "John works at Acme in Berlin.",
     },
   },
@@ -196,7 +196,7 @@ const DEFAULTS: MemoryBraidConfig = {
   },
   consolidation: {
     enabled: true,
-    startupRun: true,
+    startupRun: false,
     intervalMinutes: 360,
     opportunisticNewMemoryThreshold: 5,
     opportunisticMinMinutesSinceLastRun: 30,

@@ -15,13 +15,14 @@ describe("parseConfig", () => {
     expect(cfg.lifecycle.cleanupIntervalMinutes).toBe(360);
     expect(cfg.lifecycle.reinforceOnRecall).toBe(true);
     expect(cfg.consolidation.enabled).toBe(true);
-    expect(cfg.consolidation.startupRun).toBe(true);
+    expect(cfg.consolidation.startupRun).toBe(false);
     expect(cfg.consolidation.intervalMinutes).toBe(360);
     expect(cfg.consolidation.minSupportCount).toBe(2);
     expect(cfg.capture.selection.minPreferenceDecisionScore).toBe(0.45);
     expect(cfg.capture.selection.minProceduralScore).toBe(0.58);
     expect(cfg.consolidation.minSelectionScore).toBe(0.56);
     expect(cfg.consolidation.timeQueryParsing).toBe(true);
+    expect(cfg.entityExtraction.startup.downloadOnStartup).toBe(false);
   });
 
   it("keeps oss mode and ossConfig object", () => {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1 - 2026-03-14
+
+### Changed
+
+- Disabled startup consolidation by default to avoid gateway startup stalls while keeping opportunistic and interval consolidation available.
+- Disabled entity-extraction startup warmup by default so model download/prewarm work no longer lands on the critical gateway startup path.
+
 ## 0.7.0 - 2026-03-13
 
 ### Added

@@ -129,7 +129,7 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "downloadOnStartup": { "type": "boolean", "default": true },
+              "downloadOnStartup": { "type": "boolean", "default": false },
               "warmupText": {
                 "type": "string",
                 "default": "John works at Acme in Berlin."
@@ -186,7 +186,7 @@
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "default": true },
-          "startupRun": { "type": "boolean", "default": true },
+          "startupRun": { "type": "boolean", "default": false },
           "intervalMinutes": {
             "type": "integer",
             "minimum": 1,
