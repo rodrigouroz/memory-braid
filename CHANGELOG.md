@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0 - 2026-03-18
+
+### Changed
+
+- Migrated prompt injection from legacy `before_agent_start` to `before_prompt_build`.
+- Moved static plugin guidance to `prependSystemContext` to align with newer OpenClaw prompt-build behavior.
+- Updated regression coverage to assert the new prompt-build hook path directly.
+
+### Compatibility
+
+- Intended runtime behavior remains the same: recall context is still injected during prompt construction.
+- Recent gateway logs showed clean startup/config behavior for the new hook path and no plugin-originated runtime errors.
+
 ## 0.7.1 - 2026-03-14
 
 ### Changed

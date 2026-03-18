@@ -2,9 +2,19 @@
 
 Memory Braid is an OpenClaw `kind: "memory"` plugin that augments local memory search (core/QMD) with Mem0.
 
+## Ownership model
+
+Memory Braid is intentionally hybrid, but not with shared ownership.
+
+- OpenClaw prompt context + compaction are the source of truth for the live session.
+- Core/QMD is the source of truth for written documents, notes, and canonical project knowledge.
+- Mem0 is the source of truth for learned cross-session memory such as preferences, recurring decisions, and procedural learnings.
+
+The goal is hybrid retrieval with single ownership per memory class. Memory Braid should not re-own markdown knowledge, and Mem0 should not be treated as the canonical store for documents.
+
 ## Features
 
-- Hybrid recall: local memory + Mem0, merged with weighted RRF.
+- Hybrid recall with split ownership: local memory + Mem0, merged with weighted RRF.
 - Layered Mem0 memory: episodic captures, semantic compendium memories, and procedural agent learnings.
 - Capture-first Mem0 memory: plugin writes only captured memories to Mem0 (no markdown/session indexing).
 - Capture pipeline modes: `local`, `hybrid`, `ml`.
@@ -99,7 +109,9 @@ Migration:
 
 - If you relied on bootstrap/reconcile mirroring, pin to `<0.4.0`.
 - For `0.4.0+`, remove `bootstrap` and `reconcile` from your plugin config.
-- Keep core/QMD as the source for markdown/sessions, and use Memory Braid for capture/mem0 recall/lifecycle.
+- Keep OpenClaw prompt context as the source of truth for the live session.
+- Keep core/QMD as the source of truth for markdown and canonical written knowledge.
+- Use Memory Braid + Mem0 for learned cross-session memory, consolidation, and lifecycle management.
 
 ## Install
 
@@ -110,7 +122,7 @@ On the target machine:
 1. Install from npm:
 
 ```bash
-openclaw plugins install memory-braid@0.7.1
+openclaw plugins install memory-braid@0.8.0
 ```
 
 2. Rebuild native dependencies inside the installed extension:
