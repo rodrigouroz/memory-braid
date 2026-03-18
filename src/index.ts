@@ -2911,13 +2911,13 @@ const memoryBraidPlugin = {
       }
     });
 
-    api.on("before_agent_start", async (event, ctx) => {
+    api.on("before_prompt_build", async (event, ctx) => {
       const runId = log.newRunId();
       const scope = resolveRuntimeScopeFromHookContext(ctx);
       const persistentScope = resolvePersistentScopeFromHookContext(ctx);
       const legacyScope = resolveLegacySessionScopeFromHookContext(ctx);
       const baseResult = {
-        systemPrompt: REMEMBER_LEARNING_SYSTEM_PROMPT,
+        prependSystemContext: REMEMBER_LEARNING_SYSTEM_PROMPT,
       };
       if (isExcludedAutoMemorySession(ctx.sessionKey)) {
         log.debug("memory_braid.search.skip", {
@@ -3048,7 +3048,7 @@ const memoryBraidPlugin = {
       });
 
       return {
-        systemPrompt: REMEMBER_LEARNING_SYSTEM_PROMPT,
+        prependSystemContext: REMEMBER_LEARNING_SYSTEM_PROMPT,
         prependContext,
       };
     });

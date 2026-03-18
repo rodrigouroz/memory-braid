@@ -134,7 +134,7 @@ describe("memory-braid plugin", () => {
       expect.arrayContaining(["memory_search", "memory_get", "remember_learning"]),
     );
     expect(hooks.map((item) => item.name)).toEqual(
-      expect.arrayContaining(["before_agent_start", "before_message_write", "agent_end"]),
+      expect.arrayContaining(["before_prompt_build", "before_message_write", "agent_end"]),
     );
     expect(services.map((service) => service.id)).toContain("memory-braid-service");
     expect(commands.map((command) => command.name)).toContain("memorybraid");
@@ -693,12 +693,12 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    expect(beforeAgentStart).toBeTypeOf("function");
+    expect(beforePromptBuild).toBeTypeOf("function");
 
-    const result = await beforeAgentStart!(
+    const result = await beforePromptBuild!(
       {
         prompt: "Implement memory-braid relevance gating and mem0 relevance ranking fixes",
       },
@@ -721,7 +721,7 @@ describe("memory-braid plugin", () => {
     );
   });
 
-  it("injects separated user memories and agent learnings with stable system prompt", async () => {
+  it("injects separated user memories and agent learnings with stable system context", async () => {
     const searchSpy = vi
       .spyOn(Mem0Adapter.prototype, "searchMemories")
       .mockResolvedValueOnce([
@@ -783,11 +783,11 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
-      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string; systemPrompt?: string } | void>)
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
+      | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string; prependSystemContext?: string } | void>)
       | undefined;
 
-    const first = await beforeAgentStart!(
+    const first = await beforePromptBuild!(
       {
         prompt: "Help me with planning standups and reduce noisy learnings",
         messages: [
@@ -800,7 +800,7 @@ describe("memory-braid plugin", () => {
         sessionKey: "s1",
       },
     );
-    const second = await beforeAgentStart!(
+    const second = await beforePromptBuild!(
       {
         prompt: "Help me with planning standups and reduce noisy learnings",
         messages: [
@@ -815,11 +815,11 @@ describe("memory-braid plugin", () => {
     );
 
     expect(searchSpy).toHaveBeenCalledTimes(4);
-    expect(first && "systemPrompt" in first ? first.systemPrompt : "").toContain(
+    expect(first && "prependSystemContext" in first ? first.prependSystemContext : "").toContain(
       "remember_learning",
     );
-    expect(first && "systemPrompt" in first ? first.systemPrompt : "").toBe(
-      second && "systemPrompt" in second ? second.systemPrompt : "",
+    expect(first && "prependSystemContext" in first ? first.prependSystemContext : "").toBe(
+      second && "prependSystemContext" in second ? second.prependSystemContext : "",
     );
     expect(first && "prependContext" in first ? first.prependContext : "").toContain(
       "<user-memories>",
@@ -855,10 +855,10 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    const result = await beforeAgentStart!(
+    const result = await beforePromptBuild!(
       {
         prompt: "I need the black coffee preference from memory.",
         messages: [{ role: "user", content: "I need the black coffee preference from memory." }],
@@ -916,11 +916,11 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
 
-    const result = await beforeAgentStart!(
+    const result = await beforePromptBuild!(
       {
         prompt:
           "telegram envelope username rodrigonu date 1700000000 black coffee preference from a broader prompt wrapper",
@@ -1008,11 +1008,11 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
 
-    const result = await beforeAgentStart!(
+    const result = await beforePromptBuild!(
       {
         prompt: "What did we discuss in June?",
       },
@@ -1053,12 +1053,12 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    expect(beforeAgentStart).toBeTypeOf("function");
+    expect(beforePromptBuild).toBeTypeOf("function");
 
-    const result = await beforeAgentStart!(
+    const result = await beforePromptBuild!(
       {
         prompt: "Please help me save my hotcake recipe.",
       },
@@ -1071,7 +1071,7 @@ describe("memory-braid plugin", () => {
 
     expect(searchSpy).toHaveBeenCalledTimes(2);
     expect(result && "prependContext" in result ? result.prependContext : undefined).toBeUndefined();
-    expect(result && "systemPrompt" in result ? result.systemPrompt : "").toContain(
+    expect(result && "prependSystemContext" in result ? result.prependSystemContext : "").toContain(
       "remember_learning",
     );
   });
@@ -1095,12 +1095,12 @@ describe("memory-braid plugin", () => {
     });
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    expect(beforeAgentStart).toBeTypeOf("function");
+    expect(beforePromptBuild).toBeTypeOf("function");
 
-    await beforeAgentStart!(
+    await beforePromptBuild!(
       {
         prompt: "What do I prefer for standups?",
         messages: [
@@ -1117,7 +1117,7 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    await beforeAgentStart!(
+    await beforePromptBuild!(
       {
         prompt: "Any relevant memory?",
         messages: [
@@ -1152,12 +1152,12 @@ describe("memory-braid plugin", () => {
     const { api, hooks } = createApi();
 
     await plugin.register(api as never);
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    expect(beforeAgentStart).toBeTypeOf("function");
+    expect(beforePromptBuild).toBeTypeOf("function");
 
-    await beforeAgentStart!(
+    await beforePromptBuild!(
       {
         prompt: "What should I remember?",
         messages: [
@@ -1174,7 +1174,7 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    await beforeAgentStart!(
+    await beforePromptBuild!(
       {
         prompt: "What should I remember?",
         messages: [
@@ -1191,7 +1191,7 @@ describe("memory-braid plugin", () => {
       },
     );
 
-    await beforeAgentStart!(
+    await beforePromptBuild!(
       {
         prompt: "What should I remember?",
         messages: [
@@ -1735,10 +1735,10 @@ describe("memory-braid plugin", () => {
     const remediation = await readRemediationState(createStatePaths(stateDir));
     expect(remediation.quarantined["legacy-1"]).toBeTruthy();
 
-    const beforeAgentStart = hooks.find((entry) => entry.name === "before_agent_start")?.handler as
+    const beforePromptBuild = hooks.find((entry) => entry.name === "before_prompt_build")?.handler as
       | ((event: unknown, ctx: unknown) => Promise<{ prependContext?: string } | void>)
       | undefined;
-    const result = await beforeAgentStart?.(
+    const result = await beforePromptBuild?.(
       {
         prompt: "What do I prefer to drink?",
       },
