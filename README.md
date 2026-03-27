@@ -129,13 +129,13 @@ openclaw plugins install memory-braid@0.8.0
 
 ```bash
 cd ~/.openclaw/extensions/memory-braid
-npm rebuild sqlite3 sharp
+npm rebuild better-sqlite3 sharp
 ```
 
 Why this step exists:
 - OpenClaw plugin installs run `npm install --omit=dev --ignore-scripts` for safety.
 - This behavior is currently not user-overridable from `openclaw plugins install`.
-- `memory-braid` needs native artifacts for `sqlite3` (required by Mem0 OSS) and `sharp` (used by `@xenova/transformers`).
+- `memory-braid` needs native artifacts for `better-sqlite3` (required by Mem0 OSS) and `sharp` (used by `@xenova/transformers`).
 
 3. Enable and set as active memory slot:
 
@@ -172,7 +172,7 @@ openclaw gateway restart
 
 If you install from npm and see native module errors like:
 
-- `Could not locate the bindings file` (sqlite3)
+- `Could not locate the bindings file` (`better-sqlite3`)
 - `.../node_modules/jiti/.../node_sqlite3.node` in the stack/error text
 - `Cannot find module ... sharp-*.node`
 
@@ -180,13 +180,13 @@ run:
 
 ```bash
 cd ~/.openclaw/extensions/memory-braid
-npm rebuild sqlite3 sharp
+npm rebuild better-sqlite3 sharp
 openclaw gateway restart
 ```
 
 Note:
 - The `jiti/.../node_sqlite3.node` error is still a sqlite native artifact/runtime loading issue.
-- `memory-braid` now preloads sqlite via native `require` to avoid that path, but you still need `npm rebuild sqlite3 sharp` after `--ignore-scripts` installs.
+- `memory-braid` now preloads sqlite via native `require` to avoid that path, but you still need `npm rebuild better-sqlite3 sharp` after `--ignore-scripts` installs.
 - When this happens, startup logs now include `memory_braid.mem0.error` with:
   - `sqliteBindingsError: true`
   - `fixCommand` (copy/paste command for that machine)

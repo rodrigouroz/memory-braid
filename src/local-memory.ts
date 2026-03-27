@@ -53,12 +53,25 @@ export function resolveLocalTools(api: OpenClawPluginApi, ctx: ToolContext): {
   searchTool: AnyTool | null;
   getTool: AnyTool | null;
 } {
-  const searchTool = api.runtime.tools.createMemorySearchTool({
+  const runtimeTools = api.runtime?.tools as
+    | {
+        createMemorySearchTool?: (params: {
+          config: never;
+          agentSessionKey?: string;
+        }) => unknown;
+        createMemoryGetTool?: (params: {
+          config: never;
+          agentSessionKey?: string;
+        }) => unknown;
+      }
+    | undefined;
+
+  const searchTool = runtimeTools?.createMemorySearchTool?.({
     config: ctx.config as never,
     agentSessionKey: ctx.sessionKey,
   }) as unknown as AnyTool | null;
 
-  const getTool = api.runtime.tools.createMemoryGetTool({
+  const getTool = runtimeTools?.createMemoryGetTool?.({
     config: ctx.config as never,
     agentSessionKey: ctx.sessionKey,
   }) as unknown as AnyTool | null;

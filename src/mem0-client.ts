@@ -677,14 +677,15 @@ export class Mem0Adapter {
     if (this.pluginDir) {
       return {
         pluginDir: this.pluginDir,
-        fixCommand: `cd "${this.pluginDir}" && npm rebuild sqlite3 sharp && openclaw gateway restart`,
-        why: "OpenClaw plugin installs use --ignore-scripts, so sqlite3/sharp native artifacts may be missing after install/update.",
+        fixCommand: `cd "${this.pluginDir}" && npm rebuild better-sqlite3 sharp && openclaw gateway restart`,
+        why: "OpenClaw plugin installs use --ignore-scripts, so better-sqlite3/sharp native artifacts may be missing after install/update.",
       };
     }
 
     return {
-      fixCommand: "cd ~/.openclaw/extensions/memory-braid && npm rebuild sqlite3 sharp && openclaw gateway restart",
-      why: "OpenClaw plugin installs use --ignore-scripts, so sqlite3/sharp native artifacts may be missing after install/update.",
+      fixCommand:
+        "cd ~/.openclaw/extensions/memory-braid && npm rebuild better-sqlite3 sharp && openclaw gateway restart",
+      why: "OpenClaw plugin installs use --ignore-scripts, so better-sqlite3/sharp native artifacts may be missing after install/update.",
     };
   }
 
