@@ -19,6 +19,17 @@ type AnyTool = {
   ) => Promise<unknown>;
 };
 
+export const MEMORY_SEARCH_TOOL_PARAMETERS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    query: { type: "string", minLength: 1 },
+    query_text: { type: "string", minLength: 1 },
+    maxResults: { type: "integer", minimum: 1, maximum: 50 },
+    max_results: { type: "integer", minimum: 1, maximum: 50 },
+  },
+} as const;
+
 function tryParseTextPayload(value: unknown): unknown {
   if (!value || typeof value !== "object") {
     return undefined;

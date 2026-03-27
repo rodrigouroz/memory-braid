@@ -19,7 +19,12 @@ import { stagedDedupe } from "./dedupe.js";
 import { EntityExtractionManager } from "./entities.js";
 import { extractCandidates } from "./extract.js";
 import { MemoryBraidLogger } from "./logger.js";
-import { resolveLocalTools, runLocalGet, runLocalSearch } from "./local-memory.js";
+import {
+  MEMORY_SEARCH_TOOL_PARAMETERS,
+  resolveLocalTools,
+  runLocalGet,
+  runLocalSearch,
+} from "./local-memory.js";
 import {
   buildTaxonomy,
   formatTaxonomySummary,
@@ -1303,6 +1308,7 @@ async function runHybridRecall(params: {
   merged: MemoryBraidResult[];
 }> {
   const local = resolveLocalTools(params.api, params.ctx);
+  let localResults: MemoryBraidResult[] = [];
   if (!local.searchTool) {
     params.log.warn("memory_braid.search.skip", {
       runId: params.runId,
@@ -1311,7 +1317,6 @@ async function runHybridRecall(params: {
       sessionKey: params.ctx.sessionKey,
       workspaceHash: workspaceHashFromDir(params.ctx.workspaceDir),
     });
-    return { local: [], mem0: [], merged: [] };
   }
 
   const maxResultsRaw =
@@ -1322,22 +1327,25 @@ async function runHybridRecall(params: {
         : params.cfg.recall.maxResults;
   const maxResults = Math.max(1, Math.min(50, Math.round(Number(maxResultsRaw) || params.cfg.recall.maxResults)));
 
-  const localSearchStarted = Date.now();
-  const localSearch = await runLocalSearch({
-    searchTool: local.searchTool,
-    toolCallId: params.toolCallId ?? "memory_braid_search",
-    args: params.args ?? { query: params.query, maxResults },
-    signal: params.signal,
-    onUpdate: params.onUpdate,
-  });
-  params.log.debug("memory_braid.search.local", {
-    runId: params.runId,
-    agentId: params.ctx.agentId,
-    sessionKey: params.ctx.sessionKey,
-    workspaceHash: workspaceHashFromDir(params.ctx.workspaceDir),
-    count: localSearch.results.length,
-    durMs: Date.now() - localSearchStarted,
-  });
+  if (local.searchTool) {
+    const localSearchStarted = Date.now();
+    const localSearch = await runLocalSearch({
+      searchTool: local.searchTool,
+      toolCallId: params.toolCallId ?? "memory_braid_search",
+      args: params.args ?? { query: params.query, maxResults },
+      signal: params.signal,
+      onUpdate: params.onUpdate,
+    });
+    localResults = localSearch.results;
+    params.log.debug("memory_braid.search.local", {
+      runId: params.runId,
+      agentId: params.ctx.agentId,
+      sessionKey: params.ctx.sessionKey,
+      workspaceHash: workspaceHashFromDir(params.ctx.workspaceDir),
+      count: localSearch.results.length,
+      durMs: Date.now() - localSearchStarted,
+    });
+  }
 
   const runtimeScope = resolveRuntimeScopeFromToolContext(params.ctx);
   const persistentScope = resolvePersistentScopeFromToolContext(params.ctx);
@@ -1368,7 +1376,7 @@ async function runHybridRecall(params: {
   });
 
   const merged = mergeWithRrf({
-    local: localSearch.results,
+    local: localResults,
     mem0: mem0ForMerge,
     options: {
       rrfK: params.cfg.recall.merge.rrfK,
@@ -1393,7 +1401,7 @@ async function runHybridRecall(params: {
   params.log.debug("memory_braid.search.merge", {
     runId: params.runId,
     workspaceHash: runtimeScope.workspaceHash,
-    localCount: localSearch.results.length,
+    localCount: localResults.length,
     mem0Count: mem0ForMerge.length,
     mergedCount: merged.length,
     dedupedCount: deduped.length,
@@ -1412,7 +1420,7 @@ async function runHybridRecall(params: {
   }
 
   return {
-    local: localSearch.results,
+    local: localResults,
     mem0: mem0ForMerge,
     merged: topMerged,
   };
@@ -2190,16 +2198,12 @@ const memoryBraidPlugin = {
     api.registerTool(
       (ctx) => {
         const local = resolveLocalTools(api, ctx);
-        if (!local.searchTool || !local.getTool) {
-          return null;
-        }
-
         const searchTool = {
           name: "memory_search",
           label: "Memory Search",
           description:
-            "Hybrid memory search across local OpenClaw memory and Mem0. Returns merged, deduplicated ranked results.",
-          parameters: local.searchTool.parameters,
+            "Memory search across Mem0 with optional local OpenClaw memory when available. Returns merged, deduplicated ranked results.",
+          parameters: local.searchTool?.parameters ?? MEMORY_SEARCH_TOOL_PARAMETERS,
           execute: async (
             toolCallId: string,
             args: Record<string, unknown>,
@@ -2238,7 +2242,7 @@ const memoryBraidPlugin = {
             });
 
             return jsonToolResult({
-              mode: "hybrid_rrf",
+              mode: local.searchTool ? "hybrid_rrf" : "mem0_only",
               results: recall.merged,
               counts: {
                 local: recall.local.length,
@@ -2249,7 +2253,19 @@ const memoryBraidPlugin = {
           },
         };
 
-        const getTool = {
+        return searchTool as never;
+      },
+      { names: ["memory_search"] },
+    );
+
+    api.registerTool(
+      (ctx) => {
+        const local = resolveLocalTools(api, ctx);
+        if (!local.getTool) {
+          return null;
+        }
+
+        return {
           name: "memory_get",
           label: local.getTool.label ?? "Memory Get",
           description: local.getTool.description ?? "Read a specific local memory entry.",
@@ -2262,7 +2278,7 @@ const memoryBraidPlugin = {
           ) => {
             const runId = log.newRunId();
             const result = await runLocalGet({
-              getTool: local.getTool!,
+              getTool: local.getTool,
               toolCallId,
               args,
               signal,
@@ -2277,11 +2293,9 @@ const memoryBraidPlugin = {
             });
             return result;
           },
-        };
-
-        return [searchTool, getTool] as never;
+        } as never;
       },
-      { names: ["memory_search", "memory_get"] },
+      { names: ["memory_get"] },
     );
 
     api.registerTool(

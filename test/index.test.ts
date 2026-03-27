@@ -30,6 +30,7 @@ function createApi(params?: {
   pluginConfig?: Record<string, unknown>;
   config?: Record<string, unknown>;
   localSearchResults?: unknown[];
+  runtimeToolsAvailable?: boolean;
 }) {
   const tools: Array<{ factory: unknown; options?: unknown }> = [];
   const hooks: Array<{ name: string; handler: unknown }> = [];
@@ -57,23 +58,27 @@ function createApi(params?: {
       state: {
         resolveStateDir: () => params?.stateDir ?? "/tmp/.openclaw",
       },
-      tools: {
-        createMemorySearchTool: () => ({
-          name: "memory_search",
-          parameters: {},
-          execute: async () => ({
-            details: { results: params?.localSearchResults ?? [] },
-            content: [{ type: "text", text: "{}" }],
+      ...(params?.runtimeToolsAvailable === false
+        ? {}
+        : {
+            tools: {
+              createMemorySearchTool: () => ({
+                name: "memory_search",
+                parameters: {},
+                execute: async () => ({
+                  details: { results: params?.localSearchResults ?? [] },
+                  content: [{ type: "text", text: "{}" }],
+                }),
+              }),
+              createMemoryGetTool: () => ({
+                name: "memory_get",
+                execute: async () => ({
+                  details: { path: "", text: "" },
+                  content: [{ type: "text", text: "{}" }],
+                }),
+              }),
+            },
           }),
-        }),
-        createMemoryGetTool: () => ({
-          name: "memory_get",
-          execute: async () => ({
-            details: { path: "", text: "" },
-            content: [{ type: "text", text: "{}" }],
-          }),
-        }),
-      },
     },
     registerTool: (factory: unknown, options?: unknown) => {
       tools.push({ factory, options });
@@ -138,6 +143,59 @@ describe("memory-braid plugin", () => {
     );
     expect(services.map((service) => service.id)).toContain("memory-braid-service");
     expect(commands.map((command) => command.name)).toContain("memorybraid");
+  });
+
+  it("keeps memory_search available when local runtime tools are unavailable", async () => {
+    const searchSpy = vi.spyOn(Mem0Adapter.prototype, "searchMemories").mockResolvedValue([
+      {
+        source: "mem0",
+        snippet: "User prefers afternoon standups.",
+        score: 0.91,
+      },
+    ]);
+    const { api, tools } = createApi({
+      runtimeToolsAvailable: false,
+      pluginConfig: {
+        dedupe: {
+          semantic: {
+            enabled: false,
+          },
+        },
+      },
+    });
+
+    await plugin.register(api as never);
+
+    const boundTools = getBoundTools(tools, {
+      config: api.config,
+      workspaceDir: "/tmp",
+      agentId: "main",
+      sessionKey: "s1",
+    });
+    expect(boundTools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["memory_search", "remember_learning"]),
+    );
+    expect(boundTools.map((tool) => tool.name)).not.toContain("memory_get");
+
+    const searchTool = boundTools.find((tool) => tool.name === "memory_search");
+    expect(searchTool).toBeTruthy();
+
+    const output = await searchTool!.execute("call-1", {
+      query: "standups",
+      maxResults: 5,
+    });
+    const details = (output as {
+      details?: {
+        mode?: string;
+        results?: Array<{ snippet?: string }>;
+        counts?: { local?: number; mem0?: number; merged?: number };
+      };
+    }).details;
+
+    expect(searchSpy).toHaveBeenCalledTimes(2);
+    expect(details?.mode).toBe("mem0_only");
+    expect(details?.counts?.local).toBe(0);
+    expect(details?.results?.[0]?.snippet).toContain("afternoon standups");
   });
 
   it("does not resolve the runtime state dir during registration", async () => {
