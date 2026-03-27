@@ -1672,11 +1672,8 @@ const memoryBraidPlugin = {
   register(api: OpenClawPluginApi) {
     const cfg = parseConfig(api.pluginConfig);
     const log = new MemoryBraidLogger(api.logger, cfg.debug);
-    const initialStateDir = api.runtime.state.resolveStateDir();
-    const mem0 = new Mem0Adapter(cfg, log, { stateDir: initialStateDir });
-    const entityExtraction = new EntityExtractionManager(cfg.entityExtraction, log, {
-      stateDir: initialStateDir,
-    });
+    const mem0 = new Mem0Adapter(cfg, log);
+    const entityExtraction = new EntityExtractionManager(cfg.entityExtraction, log);
     const recallSeenByScope = new Map<string, string>();
     const captureSeenByScope = new Map<string, string>();
     const pendingInboundTurns = new Map<string, PendingInboundTurn>();

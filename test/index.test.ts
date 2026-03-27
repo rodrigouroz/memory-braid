@@ -140,6 +140,18 @@ describe("memory-braid plugin", () => {
     expect(commands.map((command) => command.name)).toContain("memorybraid");
   });
 
+  it("does not resolve the runtime state dir during registration", async () => {
+    let resolveCalls = 0;
+    const { api } = createApi();
+    api.runtime.state.resolveStateDir = () => {
+      resolveCalls += 1;
+      throw new Error("resolveStateDir should not run during register");
+    };
+
+    expect(() => plugin.register(api as never)).not.toThrow();
+    expect(resolveCalls).toBe(0);
+  });
+
   it("does not mark capture dedupe hash when mem0 add returns no id", async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-braid-index-"));
     const stateDir = path.join(tempDir, "state");
